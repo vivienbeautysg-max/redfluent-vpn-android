@@ -240,7 +240,7 @@ object ApiClient {
         return resp
     }
 
-    /** Owner 专用：只发改了的字段（见 [InviteUpdate.toJson]）。失败抛 ApiException，原因在 reason 里。 */
+    /** Owner 专用：当前的完整字段 + 改了的 region / durationDays（见 [InviteUpdate.toJson]）。失败抛 ApiException，原因在 reason 里。 */
     suspend fun updateInvite(token: String, update: InviteUpdate) {
         val resp = request("POST", "/owner/invites/update", update.toJson(), token)
         val ok = (resp["ok"] as? JsonPrimitive)?.takeIf { !it.isString }?.booleanOrNull ?: false

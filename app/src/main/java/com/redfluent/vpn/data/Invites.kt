@@ -20,6 +20,9 @@ import java.text.Normalizer
 data class OwnerInvite(
     val code: String = "",
     val label: String = "",
+    /** 当前设备数上限 / 每月流量（GB）：保存时要原样带回去（update 接口每次都完整读取这几个字段）。 */
+    val maxDevices: Int? = null,
+    val monthlyQuotaGB: Int? = null,
     val enabled: Boolean = true,
     val region: String? = null,
     val durationDays: Int? = null,
@@ -46,7 +49,10 @@ data class OwnerInvitesResponse(
 
 private val lenientJson = Json { ignoreUnknownKeys = true }
 
-private val NEW_INVITE_FIELDS = listOf("region", "durationDays", "activatedAt", "effectiveExpiresAt", "daysLeft", "expired")
+/** 格式不对时可以丢掉、这一条照样列出来的字段（丢了 maxDevices / monthlyQuotaGB 的邀请码只是不能保存）。 */
+private val NEW_INVITE_FIELDS = listOf(
+    "region", "durationDays", "activatedAt", "effectiveExpiresAt", "daysLeft", "expired", "maxDevices", "monthlyQuotaGB",
+)
 
 /**
  * 逐条解码：某条的新字段格式不对，只丢掉新字段、这一条照样列出来；整条都解不了才丢掉这一条（计入 skipped）。
@@ -156,9 +162,17 @@ sealed interface DurationChange {
     data class Set(val days: Int) : DurationChange
 }
 
-/** 要发给 /owner/invites/update 的内容：只含改了的字段。 */
+/**
+ * 要发给 /owner/invites/update 的内容。
+ * 后端每次都会完整读取 code / newCode / label / maxDevices / monthlyQuotaGB / enabled（缺了就用默认值甚至 400 "label required"，
+ * 不会"保持不变"），所以这六个字段永远带上这条邀请码【当前】的值；region / durationDays 只在改了时才带。
+ */
 data class InviteUpdate(
     val code: String,
+    val label: String,
+    val maxDevices: Int,
+    val monthlyQuotaGB: Int,
+    val enabled: Boolean,
     val region: String?,
     val duration: DurationChange,
 ) {
@@ -166,8 +180,10 @@ data class InviteUpdate(
 }
 
 /**
- * 比较「原来」和「现在选的」，只留下真正改了的字段；什么都没改 → null（保存按钮保持禁用）。
+ * 比较「原来」和「现在选的」，只把真正改了的 region / durationDays 放进去，其余字段原样带回服务器当前的值；
+ * 什么都没改 → null（保存按钮保持禁用）。
  * owner 的邀请码什么都不能改；审核码只能改区域。
+ * 列表里没给出当前的 label / maxDevices / monthlyQuotaGB（旧后端、坏数据）→ null：宁可不能保存，也不发会把它们冲成默认值的请求。
  */
 fun buildInviteUpdate(
     original: OwnerInvite,
@@ -176,6 +192,9 @@ fun buildInviteUpdate(
     kind: ProtectedKind? = null,
 ): InviteUpdate? {
     if (kind == ProtectedKind.OWNER) return null
+    if (original.label.isBlank()) return null
+    val maxDevices = original.maxDevices?.takeIf { it >= 1 } ?: return null
+    val monthlyQuotaGB = original.monthlyQuotaGB?.takeIf { it >= 1 } ?: return null
     val newRegion = normalizeRegionId(region).takeIf { it.isNotEmpty() && it != original.regionId }
     val duration: DurationChange = if (kind == ProtectedKind.REVIEW) {
         DurationChange.Unchanged
@@ -191,11 +210,25 @@ fun buildInviteUpdate(
         }
     }
     if (newRegion == null && duration == DurationChange.Unchanged) return null
-    return InviteUpdate(code = original.code, region = newRegion, duration = duration)
+    return InviteUpdate(
+        code = original.code,
+        label = original.label,
+        maxDevices = maxDevices,
+        monthlyQuotaGB = monthlyQuotaGB,
+        enabled = original.enabled,
+        region = newRegion,
+        duration = duration,
+    )
 }
 
+/** newCode = code：不改邀请码（与 iOS 发的六个字段一致；后端没给 newCode 时本来就等于 code）。 */
 fun InviteUpdate.toJson(): JsonObject = buildJsonObject {
     put("code", code)
+    put("newCode", code)
+    put("label", label)
+    put("maxDevices", maxDevices)
+    put("monthlyQuotaGB", monthlyQuotaGB)
+    put("enabled", enabled)
     region?.let { put("region", it) }
     when (val d = duration) {
         DurationChange.Unchanged -> Unit

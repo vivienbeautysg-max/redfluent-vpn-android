@@ -27,10 +27,16 @@ class InvitesTest {
         expired: Boolean = false,
         legacy: String? = null,
         enabled: Boolean = true,
+        maxDevices: Int? = 5,
+        monthlyQuotaGB: Int? = 750,
     ) = OwnerInvite(
-        code = code, label = label, enabled = enabled, region = region, durationDays = durationDays,
+        code = code, label = label, maxDevices = maxDevices, monthlyQuotaGB = monthlyQuotaGB, enabled = enabled,
+        region = region, durationDays = durationDays,
         activatedAt = activatedAt, effectiveExpiresAt = effective, expiresAt = legacy, daysLeft = daysLeft, expired = expired,
     )
+
+    /** 后端 update 每次都完整读取的六个字段（newCode = code，与 iOS 一致）。 */
+    private val BASE_KEYS = setOf("code", "newCode", "label", "maxDevices", "monthlyQuotaGB", "enabled")
 
     // ---- 解码（旧后端 / 坏字段不能让整张表消失）-------------------------------------------------------
 
@@ -49,6 +55,30 @@ class InvitesTest {
         assertEquals(30, i.durationDays)
         assertEquals(9, i.daysLeft)
         assertFalse(i.expired)
+    }
+
+    @Test
+    fun decodesTheCurrentLimitsThatTheUpdateCallMustCarryBack() {
+        val r = parseOwnerInvites(
+            root("""{"ok":true,"invites":[{"code":"C1","label":"Gina","maxDevices":7,"monthlyQuotaGB":1500,"enabled":false,"activeDevices":2}]}"""),
+        )
+        val i = r.invites.single()
+        assertEquals(7, i.maxDevices)
+        assertEquals(1500, i.monthlyQuotaGB)
+        assertFalse(i.enabled)
+    }
+
+    @Test
+    fun wrongTypedLimitsKeepTheInviteListedButNotSavable() {
+        val r = parseOwnerInvites(
+            root("""{"ok":true,"invites":[{"code":"C1","label":"Odd","maxDevices":"three","monthlyQuotaGB":null,"region":"tokyo"}]}"""),
+        )
+        val i = r.invites.single()
+        assertEquals("Odd", i.label)
+        assertNull(i.maxDevices)
+        assertNull(i.monthlyQuotaGB)
+        assertEquals(0, r.skipped)
+        assertNull(buildInviteUpdate(i, "singapore", AccessChoice.NoLimit))
     }
 
     @Test
@@ -88,7 +118,9 @@ class InvitesTest {
     fun theCodeNeverShowsUpInToString() {
         val i = invite(code = "SECRET-CODE-123", label = "Alice")
         assertFalse(i.toString().contains("SECRET-CODE-123"))
-        assertFalse(InviteUpdate("SECRET-CODE-123", "singapore", DurationChange.Unchanged).toString().contains("SECRET-CODE-123"))
+        val update = buildInviteUpdate(i, "singapore", AccessChoice.NoLimit)!!
+        assertFalse(update.toString().contains("SECRET-CODE-123"))
+        assertFalse(update.toString().contains("Alice"))
     }
 
     @Test
@@ -165,19 +197,20 @@ class InvitesTest {
     }
 
     @Test
-    fun regionOnlySendsOnlyRegion() {
+    fun regionOnlyAddsOnlyRegionToTheFullCurrentFields() {
         val u = buildInviteUpdate(invite(), "singapore", AccessChoice.NoLimit)!!
-        assertEquals(InviteUpdate("CODE-1", "singapore", DurationChange.Unchanged), u)
-        assertEquals(setOf("code", "region"), u.toJson().keys)
+        assertEquals("singapore", u.region)
+        assertEquals(DurationChange.Unchanged, u.duration)
+        assertEquals(BASE_KEYS + "region", u.toJson().keys)
         assertEquals("singapore", (u.toJson()["region"] as JsonPrimitive).content)
     }
 
     @Test
-    fun durationOnlySendsOnlyDuration() {
+    fun durationOnlyAddsOnlyDurationToTheFullCurrentFields() {
         val u = buildInviteUpdate(invite(durationDays = 30), "tokyo", AccessChoice.Days(90))!!
         assertNull(u.region)
         assertEquals(DurationChange.Set(90), u.duration)
-        assertEquals(setOf("code", "durationDays"), u.toJson().keys)
+        assertEquals(BASE_KEYS + "durationDays", u.toJson().keys)
         assertEquals(90, (u.toJson()["durationDays"] as JsonPrimitive).content.toInt())
     }
 
@@ -185,7 +218,7 @@ class InvitesTest {
     fun clearingTheDurationSendsAnExplicitNull() {
         val u = buildInviteUpdate(invite(durationDays = 30), "tokyo", AccessChoice.NoLimit)!!
         assertEquals(DurationChange.Clear, u.duration)
-        assertEquals(setOf("code", "durationDays"), u.toJson().keys)
+        assertEquals(BASE_KEYS + "durationDays", u.toJson().keys)
         assertEquals(JsonNull, u.toJson()["durationDays"])
     }
 
@@ -198,7 +231,50 @@ class InvitesTest {
     @Test
     fun bothFieldsTogether() {
         val u = buildInviteUpdate(invite(durationDays = 30), "singapore", AccessChoice.Days(365))!!
-        assertEquals(setOf("code", "region", "durationDays"), u.toJson().keys)
+        assertEquals(BASE_KEYS + setOf("region", "durationDays"), u.toJson().keys)
+    }
+
+    // 后端的 update 不是"改哪个发哪个"：label 必填（缺了 400 "label required"），maxDevices / monthlyQuotaGB / enabled
+    // 缺了会被冲成默认值（1 / 200 / 启用）。所以未改的字段必须带服务器【当前】的值。
+    @Test
+    fun theSixFieldsCarryTheServersCurrentValuesNotDefaults() {
+        val current = invite(code = "RF-ABC-1", label = "Gina Wu", maxDevices = 7, monthlyQuotaGB = 1500, enabled = false)
+        val json = buildInviteUpdate(current, "singapore", AccessChoice.NoLimit)!!.toJson()
+        assertEquals(BASE_KEYS + "region", json.keys)
+        assertEquals("RF-ABC-1", (json["code"] as JsonPrimitive).content)
+        assertEquals("RF-ABC-1", (json["newCode"] as JsonPrimitive).content) // 不改邀请码
+        assertEquals("Gina Wu", (json["label"] as JsonPrimitive).content)
+        assertEquals(7, (json["maxDevices"] as JsonPrimitive).content.toInt())
+        assertEquals(1500, (json["monthlyQuotaGB"] as JsonPrimitive).content.toInt())
+        assertEquals(false, (json["enabled"] as JsonPrimitive).content.toBooleanStrict())
+        // 数字和布尔必须是真正的 JSON 数字 / 布尔，不是引号包起来的字符串
+        for (k in listOf("maxDevices", "monthlyQuotaGB", "enabled")) assertFalse(k, (json[k] as JsonPrimitive).isString)
+    }
+
+    @Test
+    fun anEnabledInviteStaysEnabledAndOtherValuesAreCarried() {
+        val json = buildInviteUpdate(invite(maxDevices = 3, monthlyQuotaGB = 1000, enabled = true), "tokyo", AccessChoice.Days(7))!!.toJson()
+        assertEquals(true, (json["enabled"] as JsonPrimitive).content.toBooleanStrict())
+        assertEquals(3, (json["maxDevices"] as JsonPrimitive).content.toInt())
+        assertEquals(1000, (json["monthlyQuotaGB"] as JsonPrimitive).content.toInt())
+    }
+
+    @Test
+    fun labelIsSentExactlyAsTheServerReturnedIt() {
+        val json = buildInviteUpdate(invite(label = " Alice (soon) "), "singapore", AccessChoice.NoLimit)!!.toJson()
+        assertEquals(" Alice (soon) ", (json["label"] as JsonPrimitive).content)
+    }
+
+    @Test
+    fun anInviteWhoseCurrentValuesAreUnknownIsNeverSavedPartially() {
+        assertNull(buildInviteUpdate(invite(maxDevices = null), "singapore", AccessChoice.NoLimit))
+        assertNull(buildInviteUpdate(invite(monthlyQuotaGB = null), "singapore", AccessChoice.NoLimit))
+        assertNull(buildInviteUpdate(invite(label = ""), "singapore", AccessChoice.NoLimit))
+        assertNull(buildInviteUpdate(invite(label = "   "), "singapore", AccessChoice.NoLimit))
+        // 服务器会把 <1 的值当成"没给"而换成默认值，所以这种值也不能原样发回去
+        assertNull(buildInviteUpdate(invite(maxDevices = 0), "singapore", AccessChoice.NoLimit))
+        assertNull(buildInviteUpdate(invite(monthlyQuotaGB = 0), "singapore", AccessChoice.NoLimit))
+        assertNotNull(buildInviteUpdate(invite(maxDevices = 1, monthlyQuotaGB = 1), "singapore", AccessChoice.NoLimit))
     }
 
     @Test
@@ -220,7 +296,7 @@ class InvitesTest {
         assertNull(buildInviteUpdate(invite(), "tokyo", AccessChoice.Days(7), ProtectedKind.REVIEW))
         val u = buildInviteUpdate(invite(), "singapore", AccessChoice.Days(7), ProtectedKind.REVIEW)!!
         assertEquals(DurationChange.Unchanged, u.duration)
-        assertEquals(setOf("code", "region"), u.toJson().keys)
+        assertEquals(BASE_KEYS + "region", u.toJson().keys)
     }
 
     @Test
