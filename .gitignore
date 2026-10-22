@@ -1,0 +1,26 @@
+# 🔴 签名密钥与密码：绝不进仓库（丢了包名作废，泄露了别人能冒充发版）
+*.jks
+*.keystore
+keystore.properties
+
+# 引擎产物（体积大，由 sing-box 源码重新编译得到）
+libs/*.aar
+
+# 构建产物
+build/
+app/build/
+.gradle/
+local.properties
+.idea/
+*.iml
+.DS_Store
+
+# 本地备份
+.backups/
+*.bak
+*.bak-*
+
+# 发布产物与引擎缓存
+*.apk
+*.aab
+.kotlin/

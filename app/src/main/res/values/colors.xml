@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 与 iOS 版 Theme.swift 逐值对齐 -->
+<resources>
+    <color name="brand_primary">#D42E2E</color>
+    <color name="brand_secondary">#9E1A1A</color>
+    <color name="brand_tertiary">#F26666</color>
+    <color name="success">#33A64D</color>
+    <color name="warning">#F28C1A</color>
+    <color name="danger">#D92626</color>
+    <color name="bg_dark">#000000</color>
+    <color name="bg_light">#FFFFFF</color>
+</resources>
