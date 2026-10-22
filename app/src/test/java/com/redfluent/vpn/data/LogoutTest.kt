@@ -129,6 +129,8 @@ class LogoutTest {
         val off = ProfileStatus(profileId = "p1", enabled = false)
         assertFalse(isSignedOutByProfile(null, "p1", off)) // 本地已经没有账号
         assertFalse(isSignedOutByProfile(profile.copy(profileId = "p2"), "p1", off)) // 请求在途时换了账号
+        // 请求是为 p1 发的，响应恰好也写着 p2（现在的账号）：请求与现在的账号对不上，仍然不处理
+        assertFalse(isSignedOutByProfile(profile.copy(profileId = "p2"), "p1", ProfileStatus(profileId = "p2", enabled = false)))
         assertFalse(isSignedOutByProfile(profile, "p1", ProfileStatus(profileId = "other", enabled = false))) // 响应不是给它的
     }
 
