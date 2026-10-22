@@ -57,6 +57,11 @@
             <intent-filter>
                 <action android:name="android.net.VpnService" />
             </intent-filter>
+            <!-- 不支持系统的「始终开启的 VPN」：配置是连接时按所选区域现取的，
+                 系统自己拉起服务时没有配置可用。声明出来，设置里就不会出现这个开关。 -->
+            <meta-data
+                android:name="android.net.VpnService.SUPPORTS_ALWAYS_ON"
+                android:value="false" />
         </service>
 
         <receiver

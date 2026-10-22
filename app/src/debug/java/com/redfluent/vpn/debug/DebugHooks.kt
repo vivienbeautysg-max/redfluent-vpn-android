@@ -6,6 +6,8 @@ import android.util.Log
 import com.redfluent.vpn.api.ApiClient
 import com.redfluent.vpn.data.DeviceProfile
 import com.redfluent.vpn.data.ProfileStore
+import com.redfluent.vpn.data.resolveRegion
+import kotlinx.coroutines.CancellationException
 import java.io.File
 
 /**
@@ -18,7 +20,7 @@ import java.io.File
  *   1. adb 启动参数 `--es rfv_test_token <token>`
  *   2. 文件 /data/local/tmp/rfv-test-token
  *   3. 文件 <app files>/rfv-test-token（`adb shell run-as` 写入，SELinux 拦 /data/local/tmp 时的退路）
- * API 地址覆盖（指到本机 mock 用，只接受 https 或模拟器宿主 10.0.2.2）：
+ * API 地址覆盖（指到本机 mock 用）：只接受 `http://10.0.2.2:<端口>`（模拟器宿主，主机名必须精确匹配）：
  *   `--es rfv_test_base <url>` / /data/local/tmp/rfv-test-base / <app files>/rfv-test-base
  * 日志里绝不打印 token。
  */
@@ -30,6 +32,19 @@ object DebugHooks {
     private const val EXTRA_TOKEN = "rfv_test_token"
     private const val EXTRA_BASE = "rfv_test_base"
     private const val TMP_DIR = "/data/local/tmp"
+
+    private val BASE_PATTERN = Regex("^http://10\\.0\\.2\\.2:(\\d{1,5})/?$")
+
+    /**
+     * 测试用 API 地址白名单：只有 `http://10.0.2.2:<1..65535>` 通过，返回去掉尾部斜杠的规范形式；
+     * 其它一切（https、别的主机、带路径、带用户信息、10.0.2.22 之类的相似主机）返回 null。
+     */
+    internal fun allowedTestBase(raw: String?): String? {
+        val m = BASE_PATTERN.matchEntire(raw?.trim().orEmpty()) ?: return null
+        val port = m.groupValues[1].toIntOrNull() ?: return null
+        if (port !in 1..65535) return null
+        return "http://10.0.2.2:$port"
+    }
 
     /** Application.onCreate 里调用：只处理 API 地址覆盖（必须赶在任何网络请求之前）。 */
     fun onAppCreate(context: Context) {
@@ -47,37 +62,39 @@ object DebugHooks {
             ?: return
 
         val store = ProfileStore(context)
-        val status = try {
-            ApiClient.fetchProfile(token)
+        try {
+            val status = ApiClient.fetchProfile(token)
+            store.saveProfile(
+                DeviceProfile(
+                    profileId = status.profileId.ifBlank { "debug-injected" },
+                    token = token,
+                    ownerLabel = status.ownerLabel,
+                    serverRegion = status.serverRegion,
+                    configVersion = status.configVersion,
+                    monthlyQuotaGB = status.monthlyQuotaGB,
+                    expiresAt = status.expiresAt,
+                    isOwner = status.isOwner,
+                    regions = status.regions,
+                ),
+            )
+            store.setSelectedRegion(resolveRegion(store.selectedRegion(), status.regions))
+            store.setOnboarded()
+            Log.i(TAG, "profile injected: owner=${status.isOwner} regions=${status.regions.map { it.id }}")
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            Log.w(TAG, "token injection failed: ${e.message}")
-            return
+            Log.w(TAG, "token injection failed: ${e.javaClass.simpleName}")
         }
-        store.saveProfile(
-            DeviceProfile(
-                profileId = status.profileId.ifBlank { "debug-injected" },
-                token = token,
-                ownerLabel = status.ownerLabel,
-                serverRegion = status.serverRegion,
-                configVersion = status.configVersion,
-                monthlyQuotaGB = status.monthlyQuotaGB,
-                expiresAt = status.expiresAt,
-                isOwner = status.isOwner,
-                regions = status.regions,
-            ),
-        )
-        store.reconcileRegion(status.regions)
-        store.setOnboarded()
-        Log.i(TAG, "profile injected: owner=${status.isOwner} regions=${status.regions.map { it.id }}")
     }
 
     private fun applyBase(raw: String?) {
-        val url = raw?.trim()?.takeIf { it.isNotEmpty() } ?: return
-        if (url.startsWith("https://") || url.startsWith("http://10.0.2.2")) {
+        if (raw.isNullOrBlank()) return
+        val url = allowedTestBase(raw)
+        if (url != null) {
             ApiClient.setBaseUrl(url)
             Log.i(TAG, "API base overridden: $url")
         } else {
-            Log.w(TAG, "API base override rejected (only https or 10.0.2.2 allowed)")
+            Log.w(TAG, "API base override rejected (only http://10.0.2.2:<port> is allowed)")
         }
     }
 

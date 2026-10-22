@@ -1,6 +1,12 @@
 package com.redfluent.vpn.data
 
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.contentOrNull
 import java.util.Locale
 
 /** GET /owner/devices 里每台设备的 usage（当前周期，东京 + 新加坡合计）。全部带默认值，旧后端没有该字段也能解码。 */
@@ -43,7 +49,41 @@ data class OwnerDevicesResponse(
     val error: String? = null,
     val devices: List<OwnerDevice> = emptyList(),
     val period: UsagePeriod? = null,
+    /** 解码不了、被整台丢掉的设备数（0 = 全部读出来了）。 */
+    val skipped: Int = 0,
 )
+
+// ---- 宽松解码 ---------------------------------------------------------------
+
+private val lenientJson = Json { ignoreUnknownKeys = true }
+
+/**
+ * 逐台设备解码：一台设备的数据格式不对，只影响这一台，不能让整张用量表消失。
+ *  1. 整台设备正常解码；
+ *  2. 不行就去掉 usage 再解码（这台设备仍然列出来，只是没有进度条）；
+ *  3. 还不行才丢掉这一台（计入 skipped）。
+ */
+fun parseOwnerDevices(root: JsonObject): OwnerDevicesResponse {
+    val ok = (root["ok"] as? JsonPrimitive)?.takeIf { !it.isString }?.booleanOrNull ?: false
+    val error = (root["error"] as? JsonPrimitive)?.contentOrNull
+    val period = (root["period"] as? JsonObject)?.let {
+        runCatching { lenientJson.decodeFromJsonElement(UsagePeriod.serializer(), it) }.getOrNull()
+    }
+    val rawDevices = (root["devices"] as? JsonArray).orEmpty()
+    var skipped = 0
+    val devices = ArrayList<OwnerDevice>(rawDevices.size)
+    for (item in rawDevices) {
+        val obj = item as? JsonObject
+        val device = obj?.let { o ->
+            runCatching { lenientJson.decodeFromJsonElement(OwnerDevice.serializer(), o) }.getOrNull()
+                ?: runCatching {
+                    lenientJson.decodeFromJsonElement(OwnerDevice.serializer(), JsonObject(o - "usage"))
+                }.getOrNull()
+        }
+        if (device == null) skipped++ else devices += device
+    }
+    return OwnerDevicesResponse(ok = ok, error = error, devices = devices, period = period, skipped = skipped)
+}
 
 // ---- 用量条的颜色阈值 ------------------------------------------------------
 
@@ -59,18 +99,25 @@ fun usageLevel(percent: Double): UsageLevel = when {
     else -> UsageLevel.NORMAL
 }
 
+// ---- 数值保护：非有限数 / 负数不能进入显示和合计 ------------------------------------
+
+/** 已用流量：NaN、无穷、负数一律当 0（同时意味着不计入合计）。 */
+fun DeviceUsage.safeUsedGB(): Double = if (usedGB.isFinite() && usedGB >= 0.0) usedGB else 0.0
+
+/** 配额：必须是有限的正数，否则当「没有配额」。 */
+fun DeviceUsage.safeQuotaGB(): Double? = quotaGB?.takeIf { it.isFinite() && it > 0.0 }
+
 /**
  * 这台设备要画的百分比；null = 不画条。
- * 配额为空（或 0）→ null；服务器给了 percent 就用服务器的，否则按 used/quota 自己算。
+ * 配额为空 / 非法 → null；服务器给了有限的 percent 就用服务器的（负数夹到 0），否则按 used/quota 自己算。
  */
 fun DeviceUsage.barPercent(): Double? {
-    val quota = quotaGB ?: return null
-    if (!(quota > 0.0)) return null
-    val p = percent ?: (usedGB / quota * 100.0)
-    return if (p.isNaN() || p < 0.0) 0.0 else p
+    val quota = safeQuotaGB() ?: return null
+    val server = percent?.takeIf { it.isFinite() }?.let { if (it < 0.0) 0.0 else it }
+    return server ?: (safeUsedGB() / quota * 100.0).takeIf { it.isFinite() }
 }
 
-// ---- 分组与排序 ------------------------------------------------------------
+// ---- 分组与排序 -----------------------------------------------------------
 
 data class UsageGroup(
     val label: String,
@@ -83,7 +130,7 @@ fun OwnerDevice.groupLabel(): String =
         ?: ownerLabel?.trim().takeUnless { it.isNullOrEmpty() }
         ?: "Unassigned"
 
-fun OwnerDevice.usedGB(): Double = usage?.usedGB ?: 0.0
+fun OwnerDevice.usedGB(): Double = usage?.safeUsedGB() ?: 0.0
 
 /** 按邀请标签（= 用户）分组；组按总用量降序，组内设备按用量降序。用量相同时按名字，保证排序稳定。 */
 fun groupByUser(devices: List<OwnerDevice>): List<UsageGroup> =

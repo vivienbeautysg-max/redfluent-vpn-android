@@ -2,6 +2,7 @@ package com.redfluent.vpn.data
 
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonElement
 
 /** 与 iOS 版 APIClient.swift 的 DeviceProfile 逐字段对齐。 */
 @Serializable
@@ -17,8 +18,13 @@ data class DeviceProfile(
     val isOwner: Boolean = false,
     val regions: List<RegionOption> = DEFAULT_REGIONS,
 ) {
-    /** 滑动续期：只换 token，其余资料原样保留。 */
-    fun withToken(newToken: String) = copy(token = newToken)
+    /**
+     * 滑动续期：只换 token，其余资料原样保留。
+     * 只有本地存的 token 仍是「发请求时用的那个」才换——请求在途时若设备已被换成别的账号
+     * （或已被另一次续期换过），迟到的续期结果必须丢掉，不能把别人的账号写坏。
+     */
+    fun withRenewedToken(oldToken: String, newToken: String): DeviceProfile =
+        if (token == oldToken) copy(token = newToken) else this
 }
 
 @Serializable
@@ -58,9 +64,11 @@ data class Envelope(
     val expiresAt: String? = null,
     val enabled: Boolean? = null,
     val routingMode: String? = null,
-    // 1.1 新增，旧后端不返回；全部可空，缺失即「非 owner、只有东京」。
-    val isOwner: Boolean? = null,
-    val regions: List<RegionOption>? = null,
+    // 1.1 新增，旧后端不返回。故意声明成原始 JsonElement 而不是 Boolean / List：
+    // /redeem-invite 的每个新用户都要走这个信封，这两个字段格式不对（字符串、对象、坏元素……）
+    // 不能让整个激活失败——用 parseOwnerFlag / parseRegions 宽松解析，坏了就落到默认值。
+    val isOwner: JsonElement? = null,
+    val regions: JsonElement? = null,
 )
 
 /** 隧道运行状态。界面只反映真实状态，不做乐观显示。 */

@@ -87,7 +87,9 @@ fun TrafficOrb(
             .clickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
-                enabled = !busy,
+                // 连接中也允许点（= 取消）：取配置可能要等很久（超时 45 秒），球不能死着不动。
+                // 只有「正在断开」时才禁用，避免在拆除过程中反复点击。
+                enabled = state != TunnelState.STOPPING,
                 onClick = onClick,
             ),
         contentAlignment = Alignment.Center,
@@ -114,7 +116,11 @@ fun TrafficOrb(
 
         Icon(
             imageVector = Icons.Filled.Send,
-            contentDescription = if (connected) "Disconnect VPN" else "Connect VPN",
+            contentDescription = when (state) {
+                TunnelState.CONNECTED -> "Disconnect VPN"
+                TunnelState.CONNECTING -> "Cancel connection"
+                else -> "Connect VPN"
+            },
             tint = Color.White,
             modifier = Modifier
                 .size(88.dp)

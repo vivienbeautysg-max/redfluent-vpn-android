@@ -50,6 +50,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.redfluent.vpn.data.DeviceProfile
 import com.redfluent.vpn.data.RegionOption
+import com.redfluent.vpn.data.normalizeRegionId
+import com.redfluent.vpn.data.regionShown
 import com.redfluent.vpn.data.TunnelState
 import com.redfluent.vpn.ui.components.TrafficOrb
 import com.redfluent.vpn.ui.theme.Brand
@@ -229,7 +231,7 @@ private fun RegionPicker(regions: List<RegionOption>, selected: String, onSelect
     SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
         regions.forEachIndexed { index, region ->
             SegmentedButton(
-                selected = region.id == selected,
+                selected = normalizeRegionId(region.id) == normalizeRegionId(selected),
                 onClick = { onSelect(region.id) },
                 shape = SegmentedButtonDefaults.itemShape(index, regions.size),
                 colors = SegmentedButtonDefaults.colors(
@@ -243,23 +245,6 @@ private fun RegionPicker(regions: List<RegionOption>, selected: String, onSelect
             )
         }
     }
-}
-
-/**
- * "Server" 卡片里 Region 一行显示什么：
- *  - 单区域（所有非 owner）：和 1.0 一样，显示 profile 里的 serverRegion；
- *  - 多区域：已连接时显示隧道真正连着的区域（服务器确认的），没连时显示当前选中的区域。
- */
-private fun regionShown(
-    profile: DeviceProfile?,
-    multiRegion: Boolean,
-    connected: Boolean,
-    selectedRegion: String,
-    activeRegion: String?,
-): String {
-    if (!multiRegion) return profile?.serverRegion.orEmpty().ifBlank { "—" }
-    if (connected && !activeRegion.isNullOrBlank()) return activeRegion
-    return profile?.regions?.firstOrNull { it.id == selectedRegion }?.label ?: "—"
 }
 
 @Composable

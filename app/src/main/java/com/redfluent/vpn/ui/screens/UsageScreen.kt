@@ -54,6 +54,8 @@ import com.redfluent.vpn.data.barPercent
 import com.redfluent.vpn.data.formatGB
 import com.redfluent.vpn.data.formatPercent
 import com.redfluent.vpn.data.formatQuotaGB
+import com.redfluent.vpn.data.safeQuotaGB
+import com.redfluent.vpn.data.safeUsedGB
 import com.redfluent.vpn.data.subtitle
 import com.redfluent.vpn.data.title
 import com.redfluent.vpn.data.usageLevel
@@ -247,7 +249,7 @@ private fun GroupCard(group: UsageGroup) {
 @Composable
 private fun DeviceRow(device: OwnerDevice) {
     val usage = device.usage
-    val quota = usage?.quotaGB
+    val quota = usage?.safeQuotaGB()
     val percent = usage?.barPercent()
     val dimmed = !device.enabled || device.revokedAt != null
     val state = when {
@@ -301,12 +303,12 @@ private fun DeviceRow(device: OwnerDevice) {
                 UsageBar(percent = percent, color = color)
                 Spacer(Modifier.height(Spacing.xs))
                 Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
-                    Text("${formatGB(usage.usedGB)} / ${formatQuotaGB(quota)} GB", fontSize = 13.sp)
+                    Text("${formatGB(usage.safeUsedGB())} / ${formatQuotaGB(quota)} GB", fontSize = 13.sp)
                     Text(formatPercent(percent), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = color)
                 }
             } else {
                 // 没有配额：不画条，只显示已用
-                Text("${formatGB(usage.usedGB)} GB", fontSize = 13.sp)
+                Text("${formatGB(usage.safeUsedGB())} GB", fontSize = 13.sp)
             }
         }
     }

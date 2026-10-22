@@ -5,8 +5,13 @@ import com.redfluent.vpn.data.Envelope
 import com.redfluent.vpn.data.OwnerDevicesResponse
 import com.redfluent.vpn.data.ProfileStatus
 import com.redfluent.vpn.data.REGION_TOKYO
-import com.redfluent.vpn.data.normalizeRegions
+import com.redfluent.vpn.data.cleanErrorReason
+import com.redfluent.vpn.data.normalizeRegionId
+import com.redfluent.vpn.data.parseOwnerDevices
+import com.redfluent.vpn.data.parseOwnerFlag
+import com.redfluent.vpn.data.parseRegions
 import com.redfluent.vpn.data.regionConfirmed
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
@@ -47,7 +52,8 @@ class ApiException(val code: Int, val reason: String) : Exception(userMessage(co
                 "Unknown region."
             REGION_MISMATCH ->
                 "The server did not confirm the region."
-            else -> "Server error $code: $reason"
+            // 没连上服务器（code < 0）时原因本身就是一句完整的话，不加 "Server error -1:" 前缀
+            else -> if (code < 0) reason else "Server error $code: $reason"
         }
 
         const val REGION_MISMATCH = "region mismatch"
@@ -75,9 +81,13 @@ object ApiClient {
         .retryOnConnectionFailure(true)
         .build()
 
-    /** 后端在 token 接近过期时，会在任意认证响应里附带 renewedToken；在这里统一接住。 */
+    /**
+     * 后端在 token 接近过期时，会在任意认证响应里附带 renewedToken；在这里统一接住。
+     * 回调带上 (发请求时用的旧 token, 新 token)：接收方只有在本地存的 token 仍是旧 token 时才能替换，
+     * 否则（设备已换账号 / 已被别的续期换过）必须丢弃。
+     */
     @Volatile
-    var onTokenRenewed: (suspend (String) -> Unit)? = null
+    var onTokenRenewed: (suspend (oldToken: String, newToken: String) -> Unit)? = null
 
     private var base: String = DEFAULT_BASE
 
@@ -109,14 +119,18 @@ object ApiClient {
             val obj = runCatching { json.parseToJsonElement(text).jsonObjectOrNull() }.getOrNull()
 
             if (!response.isSuccessful) {
-                val reason = obj?.get("error")?.toString()?.trim('"') ?: text.ifBlank { "unknown" }
-                throw ApiException(response.code, reason)
+                // 上游挂了时可能是整页 HTML（Cloudflare 错误页）：界面上只该看到一句短话
+                val jsonError = (obj?.get("error") as? JsonPrimitive)?.contentOrNull
+                throw ApiException(response.code, cleanErrorReason(response.code, jsonError, text))
             }
             val result = obj ?: throw ApiException(response.code, "Bad response")
 
-            // 滑动续期：任何认证响应都可能带回新 token
-            result["renewedToken"]?.toString()?.trim('"')?.takeIf { it.isNotBlank() && it != "null" }
-                ?.let { onTokenRenewed?.invoke(it) }
+            // 滑动续期：任何认证响应都可能带回新 token（没带 token 的请求，如激活，不会有）
+            if (token != null) {
+                (result["renewedToken"] as? JsonPrimitive)?.contentOrNull
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { onTokenRenewed?.invoke(token, it) }
+            }
 
             result
         }
@@ -149,8 +163,8 @@ object ApiClient {
             configVersion = env.configVersion.orEmpty(),
             monthlyQuotaGB = env.monthlyQuotaGB,
             expiresAt = env.expiresAt,
-            isOwner = env.isOwner ?: false,
-            regions = normalizeRegions(env.regions),
+            isOwner = parseOwnerFlag(env.isOwner),
+            regions = parseRegions(env.regions),
         )
     }
 
@@ -166,8 +180,8 @@ object ApiClient {
             monthlyQuotaGB = env.monthlyQuotaGB,
             configVersion = env.configVersion.orEmpty(),
             expiresAt = env.expiresAt,
-            isOwner = env.isOwner ?: false,
-            regions = normalizeRegions(env.regions),
+            isOwner = parseOwnerFlag(env.isOwner),
+            regions = parseRegions(env.regions),
         )
     }
 
@@ -181,14 +195,15 @@ object ApiClient {
      * 且服务器必须在响应里确认同一个 region，否则抛错——绝不退回东京配置。
      */
     suspend fun fetchRuntimeConfig(token: String, region: String = REGION_TOKYO): RuntimeConfig {
-        val path = if (region == REGION_TOKYO) {
+        val regionId = normalizeRegionId(region).ifEmpty { REGION_TOKYO }
+        val path = if (regionId == REGION_TOKYO) {
             "/device/runtime-config"
         } else {
-            "/device/runtime-config?region=" + URLEncoder.encode(region, "UTF-8")
+            "/device/runtime-config?region=" + URLEncoder.encode(regionId, "UTF-8")
         }
         val env = request("GET", path, token = token)
         val returnedRegion = (env["region"] as? JsonPrimitive)?.contentOrNull
-        if (!regionConfirmed(region, returnedRegion)) {
+        if (!regionConfirmed(regionId, returnedRegion)) {
             throw ApiException(502, ApiException.REGION_MISMATCH)
         }
         val cfg = env["runtimeConfig"] as? JsonObject
@@ -196,17 +211,14 @@ object ApiClient {
         val name = (env["serverRegion"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
         return RuntimeConfig(
             configJson = adaptForAndroid(cfg).toString(),
-            regionId = returnedRegion?.trim()?.lowercase() ?: region,
-            regionName = name ?: region.replaceFirstChar { it.uppercase() },
+            regionId = normalizeRegionId(returnedRegion).ifEmpty { regionId },
+            regionName = name ?: regionId.replaceFirstChar { it.uppercase() },
         )
     }
 
-    /** Owner 专用：所有设备 + 当前周期用量。非 owner 的 token 会得到 403。 */
+    /** Owner 专用：所有设备 + 当前周期用量。非 owner 的 token 会得到 403。逐台设备宽松解码。 */
     suspend fun fetchOwnerDevices(token: String): OwnerDevicesResponse {
-        val resp = json.decodeFromJsonElement(
-            OwnerDevicesResponse.serializer(),
-            request("GET", "/owner/devices", token = token),
-        )
+        val resp = parseOwnerDevices(request("GET", "/owner/devices", token = token))
         if (!resp.ok) throw ApiException(500, resp.error ?: "Malformed response")
         return resp
     }
@@ -246,6 +258,12 @@ object ApiClient {
             put("totalUp", upBytes)
             put("totalDown", downBytes)
         }
-        runCatching { request("POST", "/device/heartbeat", body, token) }
+        try {
+            request("POST", "/device/heartbeat", body, token)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            // 心跳失败不影响使用
+        }
     }
 }

@@ -3,29 +3,42 @@ package com.redfluent.vpn.ui
 import android.app.Application
 import android.content.Intent
 import android.os.SystemClock
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.redfluent.vpn.BuildConfig
 import com.redfluent.vpn.api.ApiClient
+import com.redfluent.vpn.api.RuntimeConfig
 import com.redfluent.vpn.data.DeviceProfile
 import com.redfluent.vpn.data.ProfileStore
+import com.redfluent.vpn.data.ProfileSyncResult
 import com.redfluent.vpn.data.REGION_TOKYO
 import com.redfluent.vpn.data.TunnelState
 import com.redfluent.vpn.data.UsageGroup
 import com.redfluent.vpn.data.UsagePeriod
 import com.redfluent.vpn.data.groupByUser
+import com.redfluent.vpn.data.normalizeRegionId
 import com.redfluent.vpn.data.resolveRegion
+import com.redfluent.vpn.data.shouldDisconnectForRegions
 import com.redfluent.vpn.vpn.RedFluentVpnService
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+
+private const val TAG = "RfvViewModel"
 
 /** Usage 页的界面状态。刷新失败时保留上一份数据，同时标出「这份数据可能过期」。 */
 sealed interface UsageUiState {
@@ -43,6 +56,25 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private val store = ProfileStore(app)
 
+    /** 兜底：后台协程里任何没想到的异常只记日志，不能把进程带崩。 */
+    private val errorHandler = CoroutineExceptionHandler { _, e ->
+        Log.e(TAG, "unhandled failure in coroutine: ${e.javaClass.simpleName}")
+    }
+
+    private fun launchSafe(block: suspend CoroutineScope.() -> Unit): Job =
+        viewModelScope.launch(errorHandler, block = block)
+
+    /** 后台的 DataStore 读写失败只记日志（只记异常类型，不含内容）；取消信号必须原样抛出。 */
+    private suspend fun safely(what: String, block: suspend () -> Unit) {
+        try {
+            block()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "$what failed: ${e.javaClass.simpleName}")
+        }
+    }
+
     val profile: StateFlow<DeviceProfile?> =
         store.profileFlow.stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
@@ -56,8 +88,25 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val selectedRegion: StateFlow<String> =
         store.selectedRegionFlow.stateIn(viewModelScope, SharingStarted.Eagerly, REGION_TOKYO)
 
-    /** 隧道真实状态，直接来自服务。 */
-    val tunnelState: StateFlow<TunnelState> = RedFluentVpnService.state
+    /** 服务里隧道的真实状态。 */
+    private val serviceState: StateFlow<TunnelState> = RedFluentVpnService.state
+
+    /** 取配置（还没交给服务）这段时间是否在进行中。 */
+    private val _connecting = MutableStateFlow(false)
+
+    /**
+     * 界面看到的隧道状态 = 服务里的真实状态；唯一的加工：取配置期间服务还没起来，
+     * 此时显示 CONNECTING（否则界面写着 Not connected，用户再点一下就会发出第二次连接）。
+     */
+    val tunnelState: StateFlow<TunnelState> =
+        combine(serviceState, _connecting) { state, fetching ->
+            if (fetching && (state == TunnelState.DISCONNECTED || state == TunnelState.ERROR)) {
+                TunnelState.CONNECTING
+            } else {
+                state
+            }
+        }.stateIn(viewModelScope, SharingStarted.Eagerly, serviceState.value)
+
     val tunnelError: StateFlow<String?> = RedFluentVpnService.lastError
 
     /** 隧道实际连着的区域名（服务器确认的）；没连上时为 null。 */
@@ -80,25 +129,35 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val usage = _usage.asStateFlow()
 
     private var lastProfileRefreshAt = 0L
-    private var restartJob: Job? = null
+    private var refreshJob: Job? = null
     private var usageJob: Job? = null
 
+    // 「连接 / 断开 / 切区域 / 退出登录」同一时刻只能有一个在进行：
+    // 新的操作先取消旧的（包括取配置到一半的连接——它迟到的结果会被丢弃），再开始自己。
+    private var opJob: Job? = null
+    private var opGen = 0L
+
+    /** 正在取配置的区域 id（用于「服务器不再提供这个区域」时判断是否要断开）。 */
+    @Volatile
+    private var pendingRegionId: String? = null
+
     init {
-        // 后端在 token 快过期时回发新 token，这里静默换掉。
-        // 走 updateProfile（原子读改写），避免与资料刷新互相覆盖。
-        ApiClient.onTokenRenewed = { newToken ->
-            store.updateProfile { it.withToken(newToken) }
+        // 后端在 token 快过期时回发新 token：只有本地 token 仍是发请求时那个才替换。
+        ApiClient.onTokenRenewed = { oldToken, newToken ->
+            safely("token renewal") {
+                store.updateProfile { it.withRenewedToken(oldToken, newToken) }
+            }
         }
     }
 
     fun finishOnboarding() {
-        viewModelScope.launch { store.setOnboarded() }
+        launchSafe { safely("save onboarding flag") { store.setOnboarded() } }
     }
 
     fun activate(code: String) {
         val trimmed = code.trim()
         if (trimmed.isEmpty() || _activating.value) return
-        viewModelScope.launch {
+        launchSafe {
             _activating.value = true
             _activationError.value = null
             try {
@@ -113,6 +172,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 store.saveInviteCode(trimmed)
                 // 激活响应里不一定带 owner / 区域信息，立刻再取一次 /profile。
                 refreshProfile(force = true)
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 _activationError.value = e.message ?: "Activation failed"
             } finally {
@@ -121,49 +182,84 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** 退出登录：取消一切在途的操作（连接 / 刷新 / 用量），拆掉隧道，清空本地资料与用量页状态。 */
     fun signOut() {
-        viewModelScope.launch {
-            _showUsage.value = false
-            _usage.value = UsageUiState.Loading
-            stopTunnel()
-            store.clearProfile()
+        refreshJob?.cancel()
+        usageJob?.cancel()
+        _showUsage.value = false
+        _usage.value = UsageUiState.Loading
+        RedFluentVpnService.clearFailure()
+        beginOp {
+            _connecting.value = false
+            pendingRegionId = null
+            sendStop()
+            safely("clear profile") { store.clearProfile() }
         }
     }
 
+    // ---- 资料刷新 -------------------------------------------------------
+
     /**
-     * 从服务器刷新 isOwner / regions，并在已选区域不再被提供时静默退回东京。
-     * 失败一律静默：保留本地已有的值，不打扰用户。
+     * 从服务器刷新 isOwner / regions，并在已选区域不再被提供时静默退回默认区域；
+     * 若隧道正在用的区域被收回，则断开。失败只记日志，保留本地已有的值，不打扰用户。
      */
     fun refreshProfile(force: Boolean = false) {
         val now = SystemClock.elapsedRealtime()
         if (!force && now - lastProfileRefreshAt < PROFILE_REFRESH_MIN_MS) return
         lastProfileRefreshAt = now
-        viewModelScope.launch {
-            val before = store.profile() ?: return@launch
-            val status = try {
-                ApiClient.fetchProfile(before.token)
-            } catch (_: Exception) {
-                return@launch
-            }
-            // 请求在途时设备可能已被换掉（退出后用别的邀请码重新激活）。
-            // 只有 profileId 仍是发请求时那一个，才把结果写回——否则会把旧账号的 owner 标记写到新账号上。
-            var applied = false
-            store.updateProfile { current ->
-                if (current.profileId == before.profileId) {
-                    applied = true
-                    current.copy(isOwner = status.isOwner, regions = status.regions)
-                } else {
-                    current
-                }
-            }
-            if (!applied) return@launch
-            store.reconcileRegion(status.regions)
-            // 不再是 owner：收起 Usage 页
-            if (!status.isOwner) _showUsage.value = false
+        refreshJob?.cancel()
+        refreshJob = launchSafe { refreshProfileNow() }
+    }
+
+    private suspend fun refreshProfileNow() {
+        val before = store.profile() ?: return
+        val status = try {
+            ApiClient.fetchProfile(before.token)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "profile refresh failed: ${e.javaClass.simpleName}")
+            return
+        }
+        // 请求在途时设备可能已被换成别的账号：只有 profileId 仍对得上才写回；
+        // isOwner / regions 与「区域重置」在同一次 DataStore 写入里完成。
+        val applied: ProfileSyncResult? = try {
+            store.applyServerProfile(before.profileId, status)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "profile write failed: ${e.javaClass.simpleName}")
+            null
+        }
+        if (applied == null) return
+
+        // 不再是 owner：收起 Usage 页
+        if (!applied.profile.isOwner) _showUsage.value = false
+
+        // 服务器不再提供隧道正在用的区域：必须断开，不能界面写着东京、隧道却还悬在新加坡
+        val running = tunnelState.value == TunnelState.CONNECTED || tunnelState.value == TunnelState.CONNECTING
+        val inUse = RedFluentVpnService.activeRegionId.value ?: pendingRegionId
+        if (running && shouldDisconnectForRegions(inUse, applied.profile.regions)) {
+            val id = normalizeRegionId(inUse)
+            val label = before.regions.firstOrNull { normalizeRegionId(it.id) == id }?.label ?: id
+            disconnectBecauseRegionGone(label)
         }
     }
 
-    /** 点中央环：已连接就断开，否则连接。 */
+    private fun disconnectBecauseRegionGone(label: String) = beginOp {
+        _connecting.value = false
+        pendingRegionId = null
+        sendStop()
+        withTimeoutOrNull(STOP_TIMEOUT_MS) {
+            serviceState.first { it == TunnelState.DISCONNECTED || it == TunnelState.ERROR }
+        }
+        RedFluentVpnService.reportFailure("$label is no longer available.")
+        safely("save connection intent") { store.setWantConnected(false) }
+    }
+
+    // ---- 连接 / 断开 / 切区域 ----------------------------------------------
+
+    /** 点中央环：已连接（或正在连）就断开，否则连接。 */
     fun toggleTunnel() {
         when (tunnelState.value) {
             TunnelState.CONNECTED, TunnelState.CONNECTING -> stopTunnel()
@@ -172,31 +268,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * 切换区域。没连着：只记住选择；已连着（或正在连）：先断开再用新区域重连。
+     * 切换区域。没连着：只记住选择；已连着（或正在连 / 正在取配置）：用新区域重连，
+     * 并且取代任何在途的连接——旧区域迟到的配置会被丢弃，只连最后选的那个。
      */
-    fun selectRegion(id: String) {
+    fun selectRegion(rawId: String) {
+        val id = normalizeRegionId(rawId)
         val p = profile.value ?: return
-        if (p.regions.none { it.id == id }) return
-        viewModelScope.launch {
-            val restarting = restartJob?.isActive == true
-            if (store.selectedRegion() == id && !restarting) return@launch
-            store.setSelectedRegion(id)
-            val running = tunnelState.value == TunnelState.CONNECTED ||
-                tunnelState.value == TunnelState.CONNECTING
-            if (running || restarting) {
-                restartJob?.cancel()
-                restartJob = launch { restartTunnel() }
-            }
+        if (p.regions.none { normalizeRegionId(it.id) == id }) return
+        launchSafe {
+            if (store.selectedRegion() == id) return@launchSafe
+            safely("save selected region") { store.setSelectedRegion(id) }
+            RedFluentVpnService.clearFailure()
+            val st = serviceState.value
+            val tunnelUp = st == TunnelState.CONNECTED || st == TunnelState.CONNECTING || st == TunnelState.STOPPING
+            if (tunnelUp || _connecting.value) startConnect(stopFirst = tunnelUp)
         }
-    }
-
-    private suspend fun restartTunnel() {
-        stopTunnel()
-        withTimeoutOrNull(RESTART_STOP_TIMEOUT_MS) {
-            tunnelState.first { it == TunnelState.DISCONNECTED || it == TunnelState.ERROR }
-        }
-        delay(RESTART_SETTLE_MS)
-        connect(skipPermissionCheck = true)
     }
 
     fun onVpnPermissionGranted() {
@@ -214,36 +300,99 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             _needsVpnPermission.value = true
             return
         }
-        viewModelScope.launch {
-            val profile = store.profile() ?: return@launch
-            // 选中的区域若已不被提供，这里同样退回东京——不会带着过期选择去请求
-            val region = resolveRegion(store.selectedRegion(), profile.regions)
-            store.setWantConnected(true)
-            val runtime = try {
-                ApiClient.fetchRuntimeConfig(profile.token, region)
-            } catch (e: Exception) {
-                if (region == REGION_TOKYO) {
-                    // 东京的行为与 1.0 完全一致
-                    _activationError.value = e.message
-                } else {
-                    // 非默认区域：绝不回退到东京或任何内置配置，把失败明明白白显示出来
-                    val name = profile.regions.firstOrNull { it.id == region }?.label ?: region
-                    RedFluentVpnService.reportFailure("$name: ${e.message ?: "Connection failed"}")
+        startConnect(stopFirst = false)
+    }
+
+    /** 开始一个新操作（取代旧的）。block 收到自己这一代的编号，用来判断「我还是不是最新的」。 */
+    private fun beginOp(block: suspend CoroutineScope.(gen: Long) -> Unit): Job {
+        opJob?.cancel()
+        val gen = ++opGen
+        val job = launchSafe { block(gen) }
+        opJob = job
+        // 取消旧操作后，只有「最新一代」才有资格最终把 connecting 复位
+        job.invokeOnCompletion { if (gen == opGen) _connecting.value = false }
+        return job
+    }
+
+    private fun startConnect(stopFirst: Boolean) = beginOp { gen ->
+        _connecting.value = true
+        try {
+            if (stopFirst) {
+                sendStop()
+                withTimeoutOrNull(STOP_TIMEOUT_MS) {
+                    serviceState.first { it == TunnelState.DISCONNECTED || it == TunnelState.ERROR }
                 }
-                return@launch
+                delay(RESTART_SETTLE_MS)
             }
-            val intent = Intent(app, RedFluentVpnService::class.java).apply {
-                action = RedFluentVpnService.ACTION_START
-                putExtra(RedFluentVpnService.EXTRA_CONFIG, runtime.configJson)
-                putExtra(RedFluentVpnService.EXTRA_REGION_NAME, runtime.regionName)
+            if (connectOnce()) {
+                // 等服务确认接手（进入 CONNECTING / CONNECTED / ERROR），期间界面一直显示 Connecting，不闪一下 Not connected
+                withTimeoutOrNull(START_ACK_TIMEOUT_MS) {
+                    serviceState.first {
+                        it == TunnelState.CONNECTING || it == TunnelState.CONNECTED || it == TunnelState.ERROR
+                    }
+                }
             }
-            app.startForegroundService(intent)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            RedFluentVpnService.reportFailure(e.message ?: "Connection failed")
+        } finally {
+            // 被取代的旧操作迟到的 finally 不能清掉新操作的区域
+            if (gen == opGen) pendingRegionId = null
         }
     }
 
-    private fun stopTunnel() {
+    /**
+     * 取配置并交给服务。任何环节失败都变成界面上可见的错误状态（东京也一样）。
+     * 返回 true = 已经把 START 交给服务；false = 没有发出（失败或已被取代）。
+     */
+    private suspend fun connectOnce(): Boolean {
+        val profile = store.profile() ?: return false
+        // 选中的区域若已不被提供，这里退回默认区域——不会带着过期选择去请求
+        val region = resolveRegion(store.selectedRegion(), profile.regions)
+        pendingRegionId = region
+        RedFluentVpnService.clearFailure()
+        safely("save connection intent") { store.setWantConnected(true) }
+
+        val runtime: RuntimeConfig = try {
+            ApiClient.fetchRuntimeConfig(profile.token, region)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // 绝不回退到别的区域或任何内置配置，把失败明明白白显示出来
+            val name = profile.regions.firstOrNull { normalizeRegionId(it.id) == region }?.label
+                ?: region.replaceFirstChar { it.uppercase() }
+            RedFluentVpnService.reportFailure("$name: ${e.message ?: "Connection failed"}")
+            return false
+        }
+
+        // 取配置期间可能已被取代（切了区域 / 点了断开 / 退出登录）或设备已换账号：丢弃这份配置
+        currentCoroutineContext().ensureActive()
+        val latest = store.profile()
+        if (latest == null || latest.profileId != profile.profileId) return false
+
         val app = getApplication<Application>()
-        viewModelScope.launch { store.setWantConnected(false) }
+        app.startForegroundService(
+            Intent(app, RedFluentVpnService::class.java).apply {
+                action = RedFluentVpnService.ACTION_START
+                putExtra(RedFluentVpnService.EXTRA_CONFIG, runtime.configJson)
+                putExtra(RedFluentVpnService.EXTRA_REGION_ID, runtime.regionId)
+                putExtra(RedFluentVpnService.EXTRA_REGION_NAME, runtime.regionName)
+            },
+        )
+        return true
+    }
+
+    /** 用户点断开：同时取消在途的连接，免得取配置的结果迟到后又把隧道拉起来。 */
+    private fun stopTunnel() = beginOp {
+        _connecting.value = false
+        pendingRegionId = null
+        sendStop()
+        safely("save connection intent") { store.setWantConnected(false) }
+    }
+
+    private fun sendStop() {
+        val app = getApplication<Application>()
         app.startService(
             Intent(app, RedFluentVpnService::class.java).apply {
                 action = RedFluentVpnService.ACTION_STOP
@@ -265,12 +414,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun refreshUsage() {
         if (usageJob?.isActive == true) return
-        usageJob = viewModelScope.launch {
+        usageJob = launchSafe {
             val p = store.profile()
-            if (p == null || !p.isOwner) return@launch
+            if (p == null || !p.isOwner) return@launchSafe
             try {
                 val resp = ApiClient.fetchOwnerDevices(p.token)
+                if (resp.skipped > 0) Log.w(TAG, "usage: ${resp.skipped} device(s) could not be decoded")
+                // 请求在途时设备可能已换账号：不把上一个账号的用量显示给新账号
+                if (store.profile()?.profileId != p.profileId) return@launchSafe
                 _usage.value = UsageUiState.Loaded(resp.period, groupByUser(resp.devices))
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 val current = _usage.value
                 _usage.value = if (current is UsageUiState.Loaded) {
@@ -284,7 +438,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private companion object {
         const val PROFILE_REFRESH_MIN_MS = 10_000L
-        const val RESTART_STOP_TIMEOUT_MS = 5_000L
+        const val STOP_TIMEOUT_MS = 5_000L
         const val RESTART_SETTLE_MS = 500L
+        const val START_ACK_TIMEOUT_MS = 3_000L
     }
 }

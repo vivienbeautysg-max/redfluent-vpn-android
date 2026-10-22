@@ -47,7 +47,7 @@ class ProfileStore(private val context: Context) {
 
     /** 用户选的区域；没选过 = 东京。 */
     val selectedRegionFlow: Flow<String> = context.dataStore.data.map {
-        it[Keys.REGION]?.takeIf { id -> id.isNotBlank() } ?: REGION_TOKYO
+        normalizeRegionId(it[Keys.REGION]).ifEmpty { REGION_TOKYO }
     }
 
     suspend fun profile(): DeviceProfile? = profileFlow.first()
@@ -93,21 +93,28 @@ class ProfileStore(private val context: Context) {
     suspend fun selectedRegion(): String = selectedRegionFlow.first()
 
     suspend fun setSelectedRegion(id: String) {
-        context.dataStore.edit { it[Keys.REGION] = id }
+        val normalized = normalizeRegionId(id)
+        if (normalized.isEmpty()) return
+        context.dataStore.edit { it[Keys.REGION] = normalized }
     }
 
     /**
-     * 服务器不再提供已选区域时（被关闭、设备不再是 owner），静默把选择退回东京。
-     * 返回最终生效的区域。
+     * 把 /profile 的结果写回本地：isOwner / regions，以及「已选区域不再被提供就退回默认区域」，
+     * 全部在同一次 DataStore 写入里完成（中途读到只改了一半的状态是不允许的）。
+     * 判定逻辑见 [syncProfileFromServer]：设备已被换成别的账号时什么也不写，返回 null。
      */
-    suspend fun reconcileRegion(offered: List<RegionOption>): String {
-        var result = REGION_TOKYO
+    suspend fun applyServerProfile(requestedProfileId: String, status: ProfileStatus): ProfileSyncResult? {
+        var applied: ProfileSyncResult? = null
         context.dataStore.edit { prefs ->
-            val current = prefs[Keys.REGION]
-            result = resolveRegion(current, offered)
-            if (current != null && current != result) prefs[Keys.REGION] = result
+            val current = prefs[Keys.PROFILE]
+                ?.let { runCatching { json.decodeFromString<DeviceProfile>(it) }.getOrNull() }
+            val stored = prefs[Keys.REGION]
+            val result = syncProfileFromServer(current, stored, requestedProfileId, status) ?: return@edit
+            prefs[Keys.PROFILE] = json.encodeToString(DeviceProfile.serializer(), result.profile)
+            if (stored != null && stored != result.region) prefs[Keys.REGION] = result.region
+            applied = result
         }
-        return result
+        return applied
     }
 
     /** 设备公开标识：本机随机生成一次后固定，不含任何硬件标识符。 */
