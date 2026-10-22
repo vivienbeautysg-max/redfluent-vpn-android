@@ -25,6 +25,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -92,6 +94,8 @@ fun UsersScreen(
     ownerCode: String?,
     ownerLabel: String?,
     saveState: InviteSaveState,
+    expanded: Boolean,
+    onToggleExpanded: () -> Unit,
     onBack: () -> Unit,
     onRefresh: () -> Unit,
     onSave: (InviteUpdate) -> Unit,
@@ -176,8 +180,18 @@ fun UsersScreen(
                                     Text("Refresh failed", color = Brand.Danger, fontSize = 12.sp)
                                 }
                             }
-                            items(state.invites, key = { it.code.ifEmpty { it.label } }) { invite ->
-                                UserRow(invite = invite, onClick = { editing = invite })
+                            // 可折叠的列表：默认收起，标题显示 "Users · N"
+                            item(key = "users-header") {
+                                SectionHeader(
+                                    title = "Users · ${state.invites.size}",
+                                    expanded = expanded,
+                                    onClick = onToggleExpanded,
+                                )
+                            }
+                            if (expanded) {
+                                items(state.invites, key = { it.code.ifEmpty { it.label } }) { invite ->
+                                    UserRow(invite = invite, onClick = { editing = invite })
+                                }
                             }
                         }
                     }
@@ -197,6 +211,26 @@ fun UsersScreen(
                 onSaveHandled()
             },
             onSave = onSave,
+        )
+    }
+}
+
+/** 折叠段的标题行：整行可点，右边是展开 / 收起箭头。 */
+@Composable
+private fun SectionHeader(title: String, expanded: Boolean, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(Radius.md))
+            .clickable(onClick = onClick)
+            .padding(horizontal = Spacing.sm, vertical = Spacing.sm),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(title, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+        Icon(
+            if (expanded) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown,
+            contentDescription = if (expanded) "Collapse" else "Expand",
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
 }

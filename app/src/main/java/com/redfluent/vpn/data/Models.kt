@@ -32,7 +32,8 @@ data class DeviceProfile(
 
 @Serializable
 data class ProfileStatus(
-    val enabled: Boolean = false,
+    /** 服务器明确说这台设备被停用 / 登出时才为 false；不知道（缺字段）按 true，绝不因此把用户登出。 */
+    val enabled: Boolean = true,
     val profileId: String = "",
     val ownerLabel: String = "",
     val serverRegion: String = "",

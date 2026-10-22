@@ -169,6 +169,8 @@ fun ActivationScreen(
     activating: Boolean,
     error: String?,
     onActivate: (String) -> Unit,
+    /** 设备被 owner 登出后的一句话提示（平静的提示，不是错误）。 */
+    notice: String? = null,
 ) {
     var code by remember { mutableStateOf("") }
 
@@ -217,6 +219,20 @@ fun ActivationScreen(
                     .background(MaterialTheme.colorScheme.surface)
                     .padding(Spacing.md),
             ) {
+                if (notice != null) {
+                    Text(
+                        notice,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(Radius.sm))
+                            .background(Brand.Primary.copy(alpha = 0.10f))
+                            .padding(Spacing.sm),
+                    )
+                    Spacer(Modifier.height(Spacing.md))
+                }
                 Text(
                     "Enter your invite code",
                     fontSize = 22.sp,

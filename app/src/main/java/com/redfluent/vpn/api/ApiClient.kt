@@ -9,11 +9,11 @@ import com.redfluent.vpn.data.ProfileStatus
 import com.redfluent.vpn.data.REGION_TOKYO
 import com.redfluent.vpn.data.cleanErrorReason
 import com.redfluent.vpn.data.normalizeRegionId
-import com.redfluent.vpn.data.parseAccessInfo
 import com.redfluent.vpn.data.parseOwnerDevices
 import com.redfluent.vpn.data.parseOwnerFlag
 import com.redfluent.vpn.data.parseOwnerInvites
 import com.redfluent.vpn.data.parseRegions
+import com.redfluent.vpn.data.profileStatusFrom
 import com.redfluent.vpn.data.regionConfirmed
 import com.redfluent.vpn.data.toJson
 import kotlinx.coroutines.CancellationException
@@ -184,19 +184,7 @@ object ApiClient {
         val raw = request("GET", "/profile", token = token)
         val env = json.decodeFromJsonElement(Envelope.serializer(), raw)
         if (!env.ok) throw ApiException(500, env.error ?: "Malformed response")
-        return ProfileStatus(
-            enabled = env.enabled ?: false,
-            profileId = env.profileId.orEmpty(),
-            ownerLabel = env.ownerLabel.orEmpty(),
-            serverRegion = env.serverRegion.orEmpty(),
-            routingMode = env.routingMode.orEmpty(),
-            monthlyQuotaGB = env.monthlyQuotaGB,
-            configVersion = env.configVersion.orEmpty(),
-            expiresAt = env.expiresAt,
-            isOwner = parseOwnerFlag(env.isOwner),
-            regions = parseRegions(env.regions),
-            access = parseAccessInfo(raw),
-        )
+        return profileStatusFrom(env, raw)
     }
 
     /**
@@ -252,6 +240,26 @@ object ApiClient {
         val resp = parseOwnerDevices(request("GET", "/owner/devices", token = token))
         if (!resp.ok) throw ApiException(500, resp.error ?: "Malformed response")
         return resp
+    }
+
+    /** Owner 专用：把一台设备登出（POST /owner/devices/revoke）。失败抛 ApiException，原因在 reason 里。 */
+    suspend fun revokeDevice(token: String, profileId: String) {
+        val body = buildJsonObject { put("profileId", profileId) }
+        val resp = request("POST", "/owner/devices/revoke", body, token)
+        val ok = (resp["ok"] as? JsonPrimitive)?.takeIf { !it.isString }?.booleanOrNull ?: false
+        if (!ok) throw ApiException(500, (resp["error"] as? JsonPrimitive)?.contentOrNull ?: "Malformed response")
+    }
+
+    /**
+     * Owner 专用：把一个用户（邀请码）的所有可用设备一次登出（POST /owner/users/logout）。
+     * 返回服务器报告的登出台数；没报告（旧格式）为 null。接口还不存在时抛 404，由调用方决定要不要逐台回退。
+     */
+    suspend fun logoutUser(token: String, code: String): Int? {
+        val body = buildJsonObject { put("code", code) }
+        val resp = request("POST", "/owner/users/logout", body, token)
+        val ok = (resp["ok"] as? JsonPrimitive)?.takeIf { !it.isString }?.booleanOrNull ?: false
+        if (!ok) throw ApiException(500, (resp["error"] as? JsonPrimitive)?.contentOrNull ?: "Malformed response")
+        return (resp["signedOut"] as? JsonPrimitive)?.takeIf { !it.isString }?.contentOrNull?.toIntOrNull()
     }
 
     /**

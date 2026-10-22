@@ -9,7 +9,10 @@ import androidx.lifecycle.viewModelScope
 import com.redfluent.vpn.BuildConfig
 import com.redfluent.vpn.api.ApiClient
 import com.redfluent.vpn.api.ApiException
+import com.redfluent.vpn.api.LogoutAllResult
+import com.redfluent.vpn.api.OwnerLogoutApi
 import com.redfluent.vpn.api.RuntimeConfig
+import com.redfluent.vpn.api.logOutAll
 import com.redfluent.vpn.data.AccessNotice
 import com.redfluent.vpn.data.DeviceProfile
 import com.redfluent.vpn.data.FollowAction
@@ -25,9 +28,13 @@ import com.redfluent.vpn.data.UsageGroup
 import com.redfluent.vpn.data.UsagePeriod
 import com.redfluent.vpn.data.accessNotice as computeAccessNotice
 import com.redfluent.vpn.data.decideFollow
+import com.redfluent.vpn.data.findLoggableDevice
+import com.redfluent.vpn.data.findLoggableGroup
 import com.redfluent.vpn.data.groupByUser
 import com.redfluent.vpn.data.inviteErrorText
+import com.redfluent.vpn.data.isSignedOutByProfile
 import com.redfluent.vpn.data.locksConnect
+import com.redfluent.vpn.data.logoutErrorText
 import com.redfluent.vpn.data.normalizeRegionId
 import com.redfluent.vpn.data.runtimeRegionParam
 import com.redfluent.vpn.data.shouldDisconnectForRegions
@@ -66,6 +73,13 @@ sealed interface UsageUiState {
         val groups: List<UsageGroup>,
         val refreshFailed: Boolean = false,
     ) : UsageUiState
+}
+
+/** Usage 页里「Log out / Log out all devices」的进度。失败原因留在页面上，直到下一次操作或刷新成功。 */
+sealed interface UsageAction {
+    data object Idle : UsageAction
+    data object Working : UsageAction
+    data class Error(val message: String) : UsageAction
 }
 
 /** Users 页（owner 管理邀请码）的界面状态。 */
@@ -169,6 +183,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val _saveState = MutableStateFlow<InviteSaveState>(InviteSaveState.Idle)
     val saveState = _saveState.asStateFlow()
 
+    /** Users 列表是否展开：默认收起，本次使用期间记住（退出登录时复位）。 */
+    private val _usersExpanded = MutableStateFlow(false)
+    val usersExpanded = _usersExpanded.asStateFlow()
+
+    /** Usage 页里展开了设备列表的用户（按 UsageGroup.key），刷新不会收起。 */
+    private val _expandedUsage = MutableStateFlow<Set<String>>(emptySet())
+    val expandedUsage = _expandedUsage.asStateFlow()
+
+    private val _usageAction = MutableStateFlow<UsageAction>(UsageAction.Idle)
+    val usageAction = _usageAction.asStateFlow()
+
+    /** 这台设备被 owner 登出后，激活页上显示 "Signed out. …"（不是吓人的错误）。 */
+    private val _signedOut = MutableStateFlow(false)
+    val signedOutNotice = _signedOut.asStateFlow()
+
     /**
      * 主页上的到期提示（Expired · 3 Nov 2026 / N days left / Revoked）：来自资料里的到期状态，
      * 以及"无感"跟随刚发现的叫停原因（比资料刷新更早知道）。
@@ -182,6 +211,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private var usageJob: Job? = null
     private var usersJob: Job? = null
     private var saveJob: Job? = null
+    private var actionJob: Job? = null
 
     // 「连接 / 断开 / 切区域 / 退出登录」同一时刻只能有一个在进行：
     // 新的操作先取消旧的（包括取配置到一半的连接——它迟到的结果会被丢弃），再开始自己。
@@ -200,9 +230,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
 
-        // "无感"跟随（服务里）发现账号到期 / 被吊销而停了隧道：立刻刷新资料，让主页显示 Expired / Revoked
+        // "无感"跟随（服务里）发现账号到期 / 被登出而停了隧道：
+        //  - 被登出（401 / 其它 403）→ 直接回到激活页，提示 "Signed out. …"；
+        //  - 到期 → 刷新资料，让主页显示 Expired
         launchSafe {
-            RedFluentVpnService.stopReason.filterNotNull().collect { refreshProfile(force = true) }
+            RedFluentVpnService.stopReason.filterNotNull().collect { stop ->
+                if (stop.kind == StopKind.REVOKED) handleSignedOut(null) else refreshProfile(force = true)
+            }
         }
 
         // 账号处于到期 / 吊销状态期间：定期刷新资料。管理员把时长改长或恢复后，界面自动解除，无需手动操作
@@ -242,6 +276,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     appVersion = BuildConfig.VERSION_NAME + " (" + BuildConfig.VERSION_CODE + ")",
                 )
                 store.saveProfile(profile)
+                _signedOut.value = false
                 store.saveInviteCode(trimmed)
                 // 激活响应里不一定带 owner / 区域信息，立刻再取一次 /profile。
                 refreshProfile(force = true)
@@ -255,17 +290,25 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** 退出登录：取消一切在途的操作（连接 / 刷新 / 用量），拆掉隧道，清空本地资料与用量页状态。 */
-    fun signOut() {
+    /**
+     * 退出登录：取消一切在途的操作（连接 / 刷新 / 用量），拆掉隧道，清空本地资料与用量页状态。
+     * signedOut = true：不是用户自己点的，而是服务器已把这台设备登出——激活页上显示 "Signed out. …"。
+     */
+    fun signOut(signedOut: Boolean = false) {
+        _signedOut.value = signedOut
         refreshJob?.cancel()
         usageJob?.cancel()
         usersJob?.cancel()
         saveJob?.cancel()
+        actionJob?.cancel()
         _showUsage.value = false
         _usage.value = UsageUiState.Loading
         _showUsers.value = false
         _users.value = UsersUiState.Loading
         _saveState.value = InviteSaveState.Idle
+        _usersExpanded.value = false
+        _expandedUsage.value = emptySet()
+        _usageAction.value = UsageAction.Idle
         RedFluentVpnService.clearFailure()
         RedFluentVpnService.clearStopReason()
         beginOp {
@@ -273,6 +316,20 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             pendingRegionId = null
             sendStop()
             safely("clear profile") { store.clearProfile() }
+        }
+    }
+
+    /**
+     * 服务器已把这台设备登出（/profile 说 enabled = false，或隧道被 401 / 403 叫停）：
+     * 回到激活页，邀请码仍然有效，再输入一次就能重新激活。
+     * expectedProfileId：请求在途时设备可能已换成别的账号——对不上就什么也不做。
+     */
+    private fun handleSignedOut(expectedProfileId: String?) {
+        launchSafe {
+            val current = store.profile() ?: return@launchSafe
+            if (expectedProfileId != null && current.profileId != expectedProfileId) return@launchSafe
+            Log.i(TAG, "signed out by the server: back to the activation screen")
+            signOut(signedOut = true)
         }
     }
 
@@ -298,6 +355,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             throw e
         } catch (e: Exception) {
             Log.w(TAG, "profile refresh failed: ${e.javaClass.simpleName}")
+            return
+        }
+        // 服务器明确说这台设备已被登出（enabled = false）：回到激活页
+        if (isSignedOutByProfile(store.profile(), before.profileId, status)) {
+            handleSignedOut(before.profileId)
             return
         }
         // 请求在途时设备可能已被换成别的账号：只有 profileId 仍对得上才写回；
@@ -531,7 +593,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 if (resp.skipped > 0) Log.w(TAG, "usage: ${resp.skipped} device(s) could not be decoded")
                 // 请求在途时设备可能已换账号：不把上一个账号的用量显示给新账号
                 if (store.profile()?.profileId != p.profileId) return@launchSafe
-                _usage.value = UsageUiState.Loaded(resp.period, groupByUser(resp.devices))
+                _usage.value = UsageUiState.Loaded(resp.period, groupByUser(resp.devices, inviteCode.value, p.ownerLabel))
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -545,7 +607,71 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** 展开 / 收起一个用户的设备列表（本次使用期间记住）。 */
+    fun toggleUsageUser(key: String) {
+        _expandedUsage.value = _expandedUsage.value.let { if (key in it) it - key else it + key }
+    }
+
+    fun dismissUsageActionError() {
+        if (_usageAction.value is UsageAction.Error) _usageAction.value = UsageAction.Idle
+    }
+
+    /** 把一台设备登出：设备回到激活页，邀请码仍然有效。owner 自己的设备永远不会走到这里。 */
+    fun logoutDevice(profileId: String) {
+        if (actionJob?.isActive == true) return
+        val groups = (_usage.value as? UsageUiState.Loaded)?.groups ?: return
+        if (findLoggableDevice(groups, profileId) == null) return
+        runOwnerAction { token ->
+            ApiClient.revokeDevice(token, profileId)
+            null
+        }
+    }
+
+    /** 把一个用户的所有可用设备登出（接口还没上线时逐台回退）。owner 自己的邀请码永远不会走到这里。 */
+    fun logoutAll(groupKey: String) {
+        if (actionJob?.isActive == true) return
+        val groups = (_usage.value as? UsageUiState.Loaded)?.groups ?: return
+        val group = findLoggableGroup(groups, groupKey) ?: return
+        runOwnerAction { token ->
+            val api = object : OwnerLogoutApi {
+                override suspend fun logoutUser(code: String): Int? = ApiClient.logoutUser(token, code)
+                override suspend fun revokeDevice(profileId: String) = ApiClient.revokeDevice(token, profileId)
+            }
+            (logOutAll(api, group) as? LogoutAllResult.Failed)?.message
+        }
+    }
+
+    /** 跑一个 owner 操作：成功（返回 null）或失败（返回原因）之后都刷新用量，让界面显示真实状态。 */
+    private fun runOwnerAction(action: suspend (token: String) -> String?) {
+        actionJob = launchSafe {
+            _usageAction.value = UsageAction.Working
+            try {
+                val p = store.profile()
+                if (p == null || !p.isOwner) {
+                    _usageAction.value = UsageAction.Error("Not allowed.")
+                    return@launchSafe
+                }
+                val failure = action(p.token)
+                _usageAction.value = if (failure == null) UsageAction.Idle else UsageAction.Error(failure)
+                usageJob?.cancel()
+                refreshUsage()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: ApiException) {
+                _usageAction.value = UsageAction.Error(logoutErrorText(e.code, e.reason))
+                usageJob?.cancel()
+                refreshUsage()
+            } catch (e: Exception) {
+                _usageAction.value = UsageAction.Error(e.message ?: "Could not log out.")
+            }
+        }
+    }
+
     // ---- Owner：Users（每个邀请码的区域与使用时长）--------------------------------
+
+    fun toggleUsersExpanded() {
+        _usersExpanded.value = !_usersExpanded.value
+    }
 
     fun openUsers() {
         if (profile.value?.isOwner != true) return

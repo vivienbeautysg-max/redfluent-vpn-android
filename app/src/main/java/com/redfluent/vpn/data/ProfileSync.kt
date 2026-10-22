@@ -41,3 +41,21 @@ fun syncProfileFromServer(
         region = resolveRegion(storedRegion, regions),
     )
 }
+
+/**
+ * /profile 的信封 → ProfileStatus。
+ * enabled：响应里没有（或不是布尔）≠ 设备被登出——只有服务器明确说 false 才算，所以缺失按 true。
+ */
+fun profileStatusFrom(env: Envelope, raw: kotlinx.serialization.json.JsonObject): ProfileStatus = ProfileStatus(
+    enabled = env.enabled ?: true,
+    profileId = env.profileId.orEmpty(),
+    ownerLabel = env.ownerLabel.orEmpty(),
+    serverRegion = env.serverRegion.orEmpty(),
+    routingMode = env.routingMode.orEmpty(),
+    monthlyQuotaGB = env.monthlyQuotaGB,
+    configVersion = env.configVersion.orEmpty(),
+    expiresAt = env.expiresAt,
+    isOwner = parseOwnerFlag(env.isOwner),
+    regions = parseRegions(env.regions),
+    access = parseAccessInfo(raw),
+)

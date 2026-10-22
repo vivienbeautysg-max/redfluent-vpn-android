@@ -18,6 +18,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.lifecycleScope
+import com.redfluent.vpn.data.SIGNED_OUT_NOTICE
 import com.redfluent.vpn.debug.DebugHooks
 import com.redfluent.vpn.ui.AppViewModel
 import com.redfluent.vpn.ui.screens.ActivationScreen
@@ -80,6 +81,10 @@ class MainActivity : ComponentActivity() {
                     val users by viewModel.users.collectAsState()
                     val saveState by viewModel.saveState.collectAsState()
                     val accessNotice by viewModel.accessNotice.collectAsState()
+                    val usersExpanded by viewModel.usersExpanded.collectAsState()
+                    val expandedUsage by viewModel.expandedUsage.collectAsState()
+                    val usageAction by viewModel.usageAction.collectAsState()
+                    val signedOutNotice by viewModel.signedOutNotice.collectAsState()
 
                     LaunchedEffect(needsPermission) {
                         if (needsPermission) {
@@ -101,11 +106,18 @@ class MainActivity : ComponentActivity() {
                             activating = activating,
                             error = activationError,
                             onActivate = viewModel::activate,
+                            notice = if (signedOutNotice) SIGNED_OUT_NOTICE else null,
                         )
                         usageVisible -> UsageScreen(
                             state = usage,
+                            expanded = expandedUsage,
+                            action = usageAction,
                             onBack = viewModel::closeUsage,
                             onRefresh = viewModel::refreshUsage,
+                            onToggle = viewModel::toggleUsageUser,
+                            onLogoutDevice = viewModel::logoutDevice,
+                            onLogoutAll = viewModel::logoutAll,
+                            onDismissActionError = viewModel::dismissUsageActionError,
                         )
                         usersVisible -> UsersScreen(
                             state = users,
@@ -113,6 +125,8 @@ class MainActivity : ComponentActivity() {
                             ownerCode = inviteCode,
                             ownerLabel = profile?.ownerLabel,
                             saveState = saveState,
+                            expanded = usersExpanded,
+                            onToggleExpanded = viewModel::toggleUsersExpanded,
                             onBack = viewModel::closeUsers,
                             onRefresh = viewModel::refreshUsers,
                             onSave = viewModel::saveInvite,

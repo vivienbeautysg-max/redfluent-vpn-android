@@ -26,12 +26,14 @@ data class UsagePeriod(
 )
 
 /**
- * 只声明界面要用的字段，其余（包括 inviteCode 明文）故意不声明——
- * 解码时被 ignoreUnknownKeys 丢掉，永远不会进内存里的模型，更不会被显示。
+ * 只声明界面要用的字段，其余字段故意不声明——解码时被 ignoreUnknownKeys 丢掉。
+ * inviteCode（明文邀请码）1.2.1 起要声明：把设备归到"用户"（邀请码）名下，并用于「Log out all devices」。
+ * 它只留在内存里，toString 故意不含它——不显示、不落盘、不进日志。
  */
 @Serializable
 data class OwnerDevice(
     val profileId: String = "",
+    val inviteCode: String? = null,
     val inviteLabel: String? = null,
     val ownerLabel: String? = null,
     val displayName: String? = null,
@@ -41,7 +43,14 @@ data class OwnerDevice(
     val revokedAt: String? = null,
     val online: Boolean = false,
     val usage: DeviceUsage? = null,
-)
+    /** 1.2.1：这台设备最后一次真正产生流量的时间（ISO）；null = 从没用过 / 旧后端没有这个字段。 */
+    val lastUsedAt: String? = null,
+) {
+    override fun toString(): String = "OwnerDevice(${title()})"
+}
+
+/** 仍然可以使用的设备：没被停用、没被登出。 */
+fun OwnerDevice.isActive(): Boolean = enabled && revokedAt == null
 
 @Serializable
 data class OwnerDevicesResponse(
@@ -57,10 +66,18 @@ data class OwnerDevicesResponse(
 
 private val lenientJson = Json { ignoreUnknownKeys = true }
 
+/** 逐级放宽时依次丢掉的字段组合：先丢最不重要的 lastUsedAt，再丢 usage，最后连 inviteCode 一起丢。 */
+private val DEVICE_FALLBACKS: List<Set<String>> = listOf(
+    setOf("lastUsedAt"),
+    setOf("usage"),
+    setOf("lastUsedAt", "usage"),
+    setOf("lastUsedAt", "usage", "inviteCode"),
+)
+
 /**
  * 逐台设备解码：一台设备的数据格式不对，只影响这一台，不能让整张用量表消失。
  *  1. 整台设备正常解码；
- *  2. 不行就去掉 usage 再解码（这台设备仍然列出来，只是没有进度条）；
+ *  2. 不行就逐级去掉 lastUsedAt / usage / inviteCode 再解码（这台设备仍然列出来，只是缺这些信息）；
  *  3. 还不行才丢掉这一台（计入 skipped）。
  */
 fun parseOwnerDevices(root: JsonObject): OwnerDevicesResponse {
@@ -76,9 +93,11 @@ fun parseOwnerDevices(root: JsonObject): OwnerDevicesResponse {
         val obj = item as? JsonObject
         val device = obj?.let { o ->
             runCatching { lenientJson.decodeFromJsonElement(OwnerDevice.serializer(), o) }.getOrNull()
-                ?: runCatching {
-                    lenientJson.decodeFromJsonElement(OwnerDevice.serializer(), JsonObject(o - "usage"))
-                }.getOrNull()
+                ?: DEVICE_FALLBACKS.firstNotNullOfOrNull { drop ->
+                    runCatching {
+                        lenientJson.decodeFromJsonElement(OwnerDevice.serializer(), JsonObject(o - drop))
+                    }.getOrNull()
+                }
         }
         if (device == null) skipped++ else devices += device
     }
@@ -119,11 +138,33 @@ fun DeviceUsage.barPercent(): Double? {
 
 // ---- 分组与排序 -----------------------------------------------------------
 
+/**
+ * 一个用户（= 一个邀请码）。devices 里包含已登出 / 停用的设备：它们的用量仍然计入 totalGB，
+ * 但不计入 activeDevices，也不再有 Log out。
+ * code 只留在内存里（toString 不含它）；后端没给 inviteCode（旧后端）时为 null，按标签分组。
+ */
 data class UsageGroup(
     val label: String,
     val totalGB: Double,
     val devices: List<OwnerDevice>,
-)
+    val code: String? = null,
+    /** 这个用户所有设备里最近一次产生流量的时间（毫秒）；null = 从没用过。 */
+    val lastUsedAtMs: Long? = null,
+    /** 有任何一台仍可用的设备在线。 */
+    val online: Boolean = false,
+    /** 仍可用（没停用、没登出）的设备数。 */
+    val activeDevices: Int = 0,
+    /** 这是 owner 自己的邀请码：没有 Log out，服务器也会拒绝。 */
+    val isOwnerInvite: Boolean = false,
+) {
+    /** 列表里的稳定标识（展开状态按它记）。 */
+    val key: String get() = code?.let { "c:" + normalizeInviteCode(it) } ?: "l:$label"
+
+    override fun toString(): String = "UsageGroup(label=$label, devices=${devices.size})"
+}
+
+private fun normalizeInviteCode(code: String): String =
+    java.text.Normalizer.normalize(code.trim(), java.text.Normalizer.Form.NFKC).lowercase()
 
 fun OwnerDevice.groupLabel(): String =
     inviteLabel?.trim().takeUnless { it.isNullOrEmpty() }
@@ -132,20 +173,48 @@ fun OwnerDevice.groupLabel(): String =
 
 fun OwnerDevice.usedGB(): Double = usage?.safeUsedGB() ?: 0.0
 
-/** 按邀请标签（= 用户）分组；组按总用量降序，组内设备按用量降序。用量相同时按名字，保证排序稳定。 */
-fun groupByUser(devices: List<OwnerDevice>): List<UsageGroup> =
+private fun OwnerDevice.groupKey(): String =
+    inviteCode?.trim()?.takeIf { it.isNotEmpty() }?.let { "c:" + normalizeInviteCode(it) } ?: "l:${groupLabel()}"
+
+/**
+ * 按用户（邀请码；旧后端没有邀请码时按标签）分组。
+ * 组按总用量降序；用量相同时最近用过的在前（从没用过的在后），再按名字，保证排序稳定。组内设备按用量降序。
+ * ownerCode / ownerLabel 用来认出 owner 自己的邀请码（没有 Log out）。
+ */
+fun groupByUser(
+    devices: List<OwnerDevice>,
+    ownerCode: String? = null,
+    ownerLabel: String? = null,
+): List<UsageGroup> =
     devices
-        .groupBy { it.groupLabel() }
-        .map { (label, list) ->
+        .groupBy { it.groupKey() }
+        .map { (_, list) ->
+            val label = list.first().groupLabel()
+            val code = list.firstNotNullOfOrNull { it.inviteCode?.trim()?.takeIf { c -> c.isNotEmpty() } }
             UsageGroup(
                 label = label,
                 totalGB = list.sumOf { it.usedGB() },
                 devices = list.sortedWith(
                     compareByDescending<OwnerDevice> { it.usedGB() }.thenBy { it.title().lowercase() },
                 ),
+                code = code,
+                lastUsedAtMs = list.mapNotNull { parseInstantMillis(it.lastUsedAt) }.maxOrNull(),
+                online = list.any { it.online && it.isActive() },
+                activeDevices = list.count { it.isActive() },
+                isOwnerInvite = isOwnerInvite(code, label, ownerCode, ownerLabel),
             )
         }
-        .sortedWith(compareByDescending<UsageGroup> { it.totalGB }.thenBy { it.label.lowercase() })
+        .sortedWith(
+            compareByDescending<UsageGroup> { it.totalGB }
+                .thenByDescending { it.lastUsedAtMs ?: Long.MIN_VALUE }
+                .thenBy { it.label.lowercase() }
+                .thenBy { it.key },
+        )
+
+/** owner 自己的邀请码：激活时用的码一致，或标签与 owner 自己的标签一致（与 Users 页的 protectedKind 同一规则）。 */
+fun isOwnerInvite(code: String?, label: String, ownerCode: String?, ownerLabel: String?): Boolean =
+    sameInviteCode(code, ownerCode) ||
+        (ownerLabel?.trim()?.isNotEmpty() == true && label.trim().equals(ownerLabel.trim(), ignoreCase = true))
 
 /** 设备行的标题：名字。 */
 fun OwnerDevice.title(): String =
