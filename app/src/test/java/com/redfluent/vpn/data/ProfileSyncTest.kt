@@ -81,6 +81,12 @@ class ProfileSyncTest {
     }
 
     @Test
+    fun syncDiscardsWhenTheRequestWasMadeForAnotherProfileEvenIfTheResponseLooksCurrent() {
+        // 请求是替 p1 发的，本地现在是 p2，而响应里恰好写着 p2：这份响应对不上请求，不能写
+        assertNull(syncProfileFromServer(profile(id = "p2"), "tokyo", "p1", status(id = "p2", owner = true, regions = listOf(tokyo, singapore))))
+    }
+
+    @Test
     fun syncDiscardsWhenTheResponseIsForADifferentProfile() {
         assertNull(syncProfileFromServer(profile(id = "p1"), "tokyo", "p1", status(id = "p9", owner = true)))
         assertNull(syncProfileFromServer(profile(id = "p1"), "tokyo", "p1", status(id = "", owner = true)))
