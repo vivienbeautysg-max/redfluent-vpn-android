@@ -11,4 +11,8 @@ object DebugHooks {
 
     @Suppress("UNUSED_PARAMETER")
     suspend fun onActivityCreate(context: Context, intent: Intent?) = Unit
+
+    /** 正式版永远用 5 分钟的固定间隔。 */
+    @Suppress("UNUSED_PARAMETER")
+    fun followIntervalMs(context: Context): Long? = null
 }

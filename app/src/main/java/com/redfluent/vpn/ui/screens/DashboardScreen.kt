@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -20,6 +21,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.BarChart
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Group
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -48,11 +50,14 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.redfluent.vpn.data.AccessNotice
 import com.redfluent.vpn.data.DeviceProfile
 import com.redfluent.vpn.data.RegionOption
 import com.redfluent.vpn.data.normalizeRegionId
 import com.redfluent.vpn.data.regionShown
 import com.redfluent.vpn.data.TunnelState
+import com.redfluent.vpn.data.locksConnect
+import com.redfluent.vpn.data.text
 import com.redfluent.vpn.ui.components.TrafficOrb
 import com.redfluent.vpn.ui.theme.Brand
 import com.redfluent.vpn.ui.theme.Radius
@@ -70,6 +75,8 @@ fun DashboardScreen(
     onSignOut: () -> Unit,
     onSelectRegion: (String) -> Unit,
     onOpenUsage: () -> Unit,
+    onOpenUsers: () -> Unit,
+    accessNotice: AccessNotice?,
 ) {
     val connected = state == TunnelState.CONNECTED
     val bg = MaterialTheme.colorScheme.background
@@ -93,8 +100,9 @@ fun DashboardScreen(
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             TopBar(
-                showUsage = profile?.isOwner == true,
+                showOwnerEntries = profile?.isOwner == true,
                 onOpenUsage = onOpenUsage,
+                onOpenUsers = onOpenUsers,
                 onSignOut = onSignOut,
             )
 
@@ -103,6 +111,7 @@ fun DashboardScreen(
                 uplinkBps = 0L,
                 downlinkBps = 0L,
                 onClick = onToggle,
+                connectLocked = accessNotice.locksConnect(),
             )
 
             Spacer(Modifier.height(Spacing.lg))
@@ -112,6 +121,20 @@ fun DashboardScreen(
                 fontWeight = FontWeight.SemiBold,
                 color = statusColor(state),
             )
+            // 账号到期 / 快到期 / 被吊销
+            if (accessNotice != null) {
+                Spacer(Modifier.height(Spacing.xs))
+                Text(
+                    accessNotice.text(),
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = when (accessNotice) {
+                        is AccessNotice.DaysLeft -> Brand.Warning
+                        else -> Brand.Danger
+                    },
+                    textAlign = TextAlign.Center,
+                )
+            }
             if (error != null && state == TunnelState.ERROR) {
                 Spacer(Modifier.height(Spacing.xs))
                 Text(error, fontSize = 13.sp, color = Brand.Danger, textAlign = TextAlign.Center)
@@ -188,7 +211,12 @@ fun DashboardScreen(
 }
 
 @Composable
-private fun TopBar(showUsage: Boolean, onOpenUsage: () -> Unit, onSignOut: () -> Unit) {
+private fun TopBar(
+    showOwnerEntries: Boolean,
+    onOpenUsage: () -> Unit,
+    onOpenUsers: () -> Unit,
+    onSignOut: () -> Unit,
+) {
     var menuOpen by remember { mutableStateOf(false) }
     Row(
         modifier = Modifier
@@ -200,11 +228,16 @@ private fun TopBar(showUsage: Boolean, onOpenUsage: () -> Unit, onSignOut: () ->
         Text("RedFluent VPN", fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
         Row(verticalAlignment = Alignment.CenterVertically) {
             // Owner 才有的入口
-            if (showUsage) {
-                TextButton(onClick = onOpenUsage) {
+            if (showOwnerEntries) {
+                TextButton(onClick = onOpenUsage, contentPadding = PaddingValues(horizontal = Spacing.sm)) {
                     Icon(Icons.Filled.BarChart, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(Spacing.xs))
                     Text("Usage")
+                }
+                TextButton(onClick = onOpenUsers, contentPadding = PaddingValues(horizontal = Spacing.sm)) {
+                    Icon(Icons.Filled.Group, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(Spacing.xs))
+                    Text("Users")
                 }
             }
             Box {

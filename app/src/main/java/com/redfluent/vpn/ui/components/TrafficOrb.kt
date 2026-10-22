@@ -18,6 +18,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.geometry.Offset
@@ -50,9 +51,12 @@ fun TrafficOrb(
     uplinkBps: Long,
     downlinkBps: Long,
     onClick: () -> Unit,
+    /** 账号到期 / 被吊销：不允许发起连接（已连着时仍可断开）。 */
+    connectLocked: Boolean = false,
 ) {
     val busy = state == TunnelState.CONNECTING || state == TunnelState.STOPPING
     val connected = state == TunnelState.CONNECTED
+    val lockedIdle = connectLocked && (state == TunnelState.DISCONNECTED || state == TunnelState.ERROR)
 
     // 已连接时整体放大 1.05（iOS: spring(duration: 0.6)）
     val scale by animateFloatAsState(
@@ -84,12 +88,13 @@ fun TrafficOrb(
             .padding(top = Spacing.lg)
             .size(260.dp)
             .scale(scale)
+            .alpha(if (lockedIdle) 0.4f else 1f)
             .clickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
                 // 连接中也允许点（= 取消）：取配置可能要等很久（超时 45 秒），球不能死着不动。
                 // 只有「正在断开」时才禁用，避免在拆除过程中反复点击。
-                enabled = state != TunnelState.STOPPING,
+                enabled = state != TunnelState.STOPPING && !lockedIdle,
                 onClick = onClick,
             ),
         contentAlignment = Alignment.Center,

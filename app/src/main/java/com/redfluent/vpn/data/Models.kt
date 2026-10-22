@@ -17,6 +17,9 @@ data class DeviceProfile(
     // 1.1 新增。旧版本存下来的 profile 没有这两项，解码时落到默认值：非 owner、只有东京。
     val isOwner: Boolean = false,
     val regions: List<RegionOption> = DEFAULT_REGIONS,
+    // 1.2 新增：账号（邀请码）的到期状态，来自 /profile；旧后端没有这些字段，默认「没到期」。
+    val daysLeft: Int? = null,
+    val expired: Boolean = false,
 ) {
     /**
      * 滑动续期：只换 token，其余资料原样保留。
@@ -39,6 +42,8 @@ data class ProfileStatus(
     val expiresAt: String? = null,
     val isOwner: Boolean = false,
     val regions: List<RegionOption> = DEFAULT_REGIONS,
+    /** 响应里带了到期字段才有值（null = 旧后端 / 没有这组字段，本地原值保持不动）。 */
+    val access: AccessInfo? = null,
 )
 
 @Serializable

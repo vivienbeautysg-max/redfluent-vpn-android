@@ -24,6 +24,7 @@ import com.redfluent.vpn.ui.screens.ActivationScreen
 import com.redfluent.vpn.ui.screens.DashboardScreen
 import com.redfluent.vpn.ui.screens.OnboardingScreen
 import com.redfluent.vpn.ui.screens.UsageScreen
+import com.redfluent.vpn.ui.screens.UsersScreen
 import com.redfluent.vpn.ui.theme.RedFluentTheme
 import kotlinx.coroutines.launch
 
@@ -75,6 +76,10 @@ class MainActivity : ComponentActivity() {
                     val activeRegion by viewModel.activeRegion.collectAsState()
                     val showUsage by viewModel.showUsage.collectAsState()
                     val usage by viewModel.usage.collectAsState()
+                    val showUsers by viewModel.showUsers.collectAsState()
+                    val users by viewModel.users.collectAsState()
+                    val saveState by viewModel.saveState.collectAsState()
+                    val accessNotice by viewModel.accessNotice.collectAsState()
 
                     LaunchedEffect(needsPermission) {
                         if (needsPermission) {
@@ -84,9 +89,11 @@ class MainActivity : ComponentActivity() {
                     }
 
                     val usageVisible = showUsage && profile?.isOwner == true
+                    val usersVisible = showUsers && profile?.isOwner == true
 
-                    // 系统返回手势 / 返回键：从 Usage 回到主页
+                    // 系统返回手势 / 返回键：从 Usage / Users 回到主页（Users 的编辑面板打开时，返回先关面板）
                     BackHandler(enabled = usageVisible) { viewModel.closeUsage() }
+                    BackHandler(enabled = usersVisible) { viewModel.closeUsers() }
 
                     when {
                         !onboarded -> OnboardingScreen(onDone = viewModel::finishOnboarding)
@@ -100,6 +107,17 @@ class MainActivity : ComponentActivity() {
                             onBack = viewModel::closeUsage,
                             onRefresh = viewModel::refreshUsage,
                         )
+                        usersVisible -> UsersScreen(
+                            state = users,
+                            ownerRegions = profile?.regions.orEmpty(),
+                            ownerCode = inviteCode,
+                            ownerLabel = profile?.ownerLabel,
+                            saveState = saveState,
+                            onBack = viewModel::closeUsers,
+                            onRefresh = viewModel::refreshUsers,
+                            onSave = viewModel::saveInvite,
+                            onSaveHandled = viewModel::resetSaveState,
+                        )
                         else -> DashboardScreen(
                             profile = profile,
                             state = state,
@@ -111,6 +129,8 @@ class MainActivity : ComponentActivity() {
                             onSignOut = viewModel::signOut,
                             onSelectRegion = viewModel::selectRegion,
                             onOpenUsage = viewModel::openUsage,
+                            onOpenUsers = viewModel::openUsers,
+                            accessNotice = accessNotice,
                         )
                     }
                 }

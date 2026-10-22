@@ -175,6 +175,13 @@ object DefaultNetworkMonitor {
 
     private var callback: ConnectivityManager.NetworkCallback? = null
 
+    /**
+     * 1.2：底层网络变化（切换 / 链路属性变化 / 丢失）时额外通知一次，用于触发"无感"跟随检查。
+     * 只是附加的旁路通知，不改变上面通知引擎的任何逻辑；由服务在隧道运行期间设置、停止时清空。
+     */
+    @Volatile
+    var onNetworkChanged: (() -> Unit)? = null
+
     fun start(context: Context, listener: InterfaceUpdateListener) {
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
         stop(context)
@@ -217,6 +224,7 @@ object DefaultNetworkMonitor {
         val index = runCatching { NetworkInterface.getByName(name)?.index ?: -1 }.getOrDefault(-1)
         val isExpensive = caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) == false
         runCatching { listener.updateDefaultInterface(name, index, isExpensive, false) }
+        runCatching { onNetworkChanged?.invoke() }
     }
 
     fun stop(context: Context) {

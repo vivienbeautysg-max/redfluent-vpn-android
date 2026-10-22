@@ -8,18 +8,31 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.redfluent.vpn.BuildConfig
 import com.redfluent.vpn.api.ApiClient
+import com.redfluent.vpn.api.ApiException
 import com.redfluent.vpn.api.RuntimeConfig
+import com.redfluent.vpn.data.AccessNotice
 import com.redfluent.vpn.data.DeviceProfile
+import com.redfluent.vpn.data.FollowAction
+import com.redfluent.vpn.data.FollowOutcome
+import com.redfluent.vpn.data.InviteUpdate
+import com.redfluent.vpn.data.OwnerInvite
 import com.redfluent.vpn.data.ProfileStore
 import com.redfluent.vpn.data.ProfileSyncResult
 import com.redfluent.vpn.data.REGION_TOKYO
+import com.redfluent.vpn.data.StopKind
 import com.redfluent.vpn.data.TunnelState
 import com.redfluent.vpn.data.UsageGroup
 import com.redfluent.vpn.data.UsagePeriod
+import com.redfluent.vpn.data.accessNotice as computeAccessNotice
+import com.redfluent.vpn.data.decideFollow
 import com.redfluent.vpn.data.groupByUser
+import com.redfluent.vpn.data.inviteErrorText
+import com.redfluent.vpn.data.locksConnect
 import com.redfluent.vpn.data.normalizeRegionId
-import com.redfluent.vpn.data.resolveRegion
+import com.redfluent.vpn.data.runtimeRegionParam
 import com.redfluent.vpn.data.shouldDisconnectForRegions
+import com.redfluent.vpn.data.sortInvites
+import com.redfluent.vpn.debug.DebugHooks
 import com.redfluent.vpn.vpn.RedFluentVpnService
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineExceptionHandler
@@ -32,8 +45,12 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
@@ -49,6 +66,21 @@ sealed interface UsageUiState {
         val groups: List<UsageGroup>,
         val refreshFailed: Boolean = false,
     ) : UsageUiState
+}
+
+/** Users 页（owner 管理邀请码）的界面状态。 */
+sealed interface UsersUiState {
+    data object Loading : UsersUiState
+    data class Error(val message: String) : UsersUiState
+    data class Loaded(val invites: List<OwnerInvite>, val refreshFailed: Boolean = false) : UsersUiState
+}
+
+/** 编辑面板里「保存」的进度。 */
+sealed interface InviteSaveState {
+    data object Idle : InviteSaveState
+    data object Saving : InviteSaveState
+    data object Done : InviteSaveState
+    data class Error(val message: String) : InviteSaveState
 }
 
 /** 界面的唯一状态源。所有显示都基于真实状态，不做乐观更新。 */
@@ -128,9 +160,28 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val _usage = MutableStateFlow<UsageUiState>(UsageUiState.Loading)
     val usage = _usage.asStateFlow()
 
+    private val _showUsers = MutableStateFlow(false)
+    val showUsers = _showUsers.asStateFlow()
+
+    private val _users = MutableStateFlow<UsersUiState>(UsersUiState.Loading)
+    val users = _users.asStateFlow()
+
+    private val _saveState = MutableStateFlow<InviteSaveState>(InviteSaveState.Idle)
+    val saveState = _saveState.asStateFlow()
+
+    /**
+     * 主页上的到期提示（Expired · 3 Nov 2026 / N days left / Revoked）：来自资料里的到期状态，
+     * 以及"无感"跟随刚发现的叫停原因（比资料刷新更早知道）。
+     */
+    val accessNotice: StateFlow<AccessNotice?> =
+        combine(profile, RedFluentVpnService.stopReason) { p, stop -> computeAccessNotice(p, stop) }
+            .stateIn(viewModelScope, SharingStarted.Eagerly, null)
+
     private var lastProfileRefreshAt = 0L
     private var refreshJob: Job? = null
     private var usageJob: Job? = null
+    private var usersJob: Job? = null
+    private var saveJob: Job? = null
 
     // 「连接 / 断开 / 切区域 / 退出登录」同一时刻只能有一个在进行：
     // 新的操作先取消旧的（包括取配置到一半的连接——它迟到的结果会被丢弃），再开始自己。
@@ -146,6 +197,28 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         ApiClient.onTokenRenewed = { oldToken, newToken ->
             safely("token renewal") {
                 store.updateProfile { it.withRenewedToken(oldToken, newToken) }
+            }
+        }
+
+        // "无感"跟随（服务里）发现账号到期 / 被吊销而停了隧道：立刻刷新资料，让主页显示 Expired / Revoked
+        launchSafe {
+            RedFluentVpnService.stopReason.filterNotNull().collect { refreshProfile(force = true) }
+        }
+
+        // 账号处于到期 / 吊销状态期间：定期刷新资料。管理员把时长改长或恢复后，界面自动解除，无需手动操作
+        launchSafe {
+            accessNotice.map { it.locksConnect() }.distinctUntilChanged().collectLatest { locked ->
+                if (locked) {
+                    val interval = if (BuildConfig.DEBUG) {
+                        DebugHooks.followIntervalMs(getApplication<Application>()) ?: EXPIRED_POLL_MS
+                    } else {
+                        EXPIRED_POLL_MS
+                    }
+                    while (true) {
+                        delay(interval)
+                        refreshProfile(force = true)
+                    }
+                }
             }
         }
     }
@@ -186,9 +259,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun signOut() {
         refreshJob?.cancel()
         usageJob?.cancel()
+        usersJob?.cancel()
+        saveJob?.cancel()
         _showUsage.value = false
         _usage.value = UsageUiState.Loading
+        _showUsers.value = false
+        _users.value = UsersUiState.Loading
+        _saveState.value = InviteSaveState.Idle
         RedFluentVpnService.clearFailure()
+        RedFluentVpnService.clearStopReason()
         beginOp {
             _connecting.value = false
             pendingRegionId = null
@@ -233,13 +312,29 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
         if (applied == null) return
 
-        // 不再是 owner：收起 Usage 页
-        if (!applied.profile.isOwner) _showUsage.value = false
+        // 不再是 owner：收起 Usage / Users 页
+        if (!applied.profile.isOwner) {
+            _showUsage.value = false
+            _showUsers.value = false
+        }
 
-        // 服务器不再提供隧道正在用的区域：必须断开，不能界面写着东京、隧道却还悬在新加坡
+        // 资料已刷新：以资料为准，清掉服务给的"刚被叫停"提示（到期以资料为准；吊销要等设备恢复启用才解除）
+        RedFluentVpnService.stopReason.value?.let { stop ->
+            if (stop.kind == StopKind.EXPIRED || status.enabled) RedFluentVpnService.clearStopReason()
+        }
+
         val running = tunnelState.value == TunnelState.CONNECTED || tunnelState.value == TunnelState.CONNECTING
+
+        // 账号已到期但隧道还连着（刚好过期、下一次跟随检查还没到）：立刻断开
+        if (running && applied.profile.expired && !applied.profile.isOwner) {
+            stopTunnel()
+            return
+        }
+
+        // 服务器不再提供隧道正在用的区域：owner 必须断开，不能界面写着东京、隧道却还悬在新加坡。
+        // 普通用户不在此列——他们的区域由服务器分配，换了区域由服务里的"无感"跟随自动热重载。
         val inUse = RedFluentVpnService.activeRegionId.value ?: pendingRegionId
-        if (running && shouldDisconnectForRegions(inUse, applied.profile.regions)) {
+        if (running && applied.profile.isOwner && shouldDisconnectForRegions(inUse, applied.profile.regions)) {
             val id = normalizeRegionId(inUse)
             val label = before.regions.firstOrNull { normalizeRegionId(it.id) == id }?.label ?: id
             disconnectBecauseRegionGone(label)
@@ -263,7 +358,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun toggleTunnel() {
         when (tunnelState.value) {
             TunnelState.CONNECTED, TunnelState.CONNECTING -> stopTunnel()
-            else -> connect()
+            else -> {
+                // 账号到期 / 被吊销期间不发起连接（界面上按钮也是禁用的）
+                if (!accessNotice.value.locksConnect()) connect()
+            }
         }
     }
 
@@ -348,8 +446,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      */
     private suspend fun connectOnce(): Boolean {
         val profile = store.profile() ?: return false
-        // 选中的区域若已不被提供，这里退回默认区域——不会带着过期选择去请求
-        val region = resolveRegion(store.selectedRegion(), profile.regions)
+        // 普通用户：不带 region 参数，区域由服务器按「分配给这个账号的区域」决定；
+        // owner：用自己选的区域（已不被提供则退回服务器默认区域——不会带着过期选择去请求）
+        val region: String? = runtimeRegionParam(profile.isOwner, store.selectedRegion(), profile.regions)
         pendingRegionId = region
         RedFluentVpnService.clearFailure()
         safely("save connection intent") { store.setWantConnected(true) }
@@ -359,9 +458,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
+            // 账号到期 / 被吊销：显示 Expired / Revoked（与"无感"跟随同一条规则），而不是通用的连接失败
+            if (e is ApiException) {
+                val action = decideFollow(null, FollowOutcome.Failed(e.code, e.reason, e.expiresAt))
+                if (action is FollowAction.Stop) {
+                    RedFluentVpnService.reportAccessEnded(action.kind, action.expiresAt)
+                    refreshProfile(force = true)
+                    return false
+                }
+            }
             // 绝不回退到别的区域或任何内置配置，把失败明明白白显示出来
-            val name = profile.regions.firstOrNull { normalizeRegionId(it.id) == region }?.label
-                ?: region.replaceFirstChar { it.uppercase() }
+            val name = (if (region != null) profile.regions.firstOrNull { normalizeRegionId(it.id) == region }?.label else null)
+                ?: region?.replaceFirstChar { it.uppercase() }
+                ?: profile.serverRegion.ifBlank { "Server" }
             RedFluentVpnService.reportFailure("$name: ${e.message ?: "Connection failed"}")
             return false
         }
@@ -436,7 +545,75 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    // ---- Owner：Users（每个邀请码的区域与使用时长）--------------------------------
+
+    fun openUsers() {
+        if (profile.value?.isOwner != true) return
+        _saveState.value = InviteSaveState.Idle
+        _showUsers.value = true
+        refreshUsers()
+    }
+
+    fun closeUsers() {
+        _showUsers.value = false
+        saveJob?.cancel()
+        _saveState.value = InviteSaveState.Idle
+    }
+
+    fun refreshUsers() {
+        if (usersJob?.isActive == true) return
+        usersJob = launchSafe {
+            val p = store.profile()
+            if (p == null || !p.isOwner) return@launchSafe
+            try {
+                val resp = ApiClient.fetchOwnerInvites(p.token)
+                if (resp.skipped > 0) Log.w(TAG, "users: ${resp.skipped} invite(s) could not be decoded")
+                if (store.profile()?.profileId != p.profileId) return@launchSafe
+                _users.value = UsersUiState.Loaded(sortInvites(resp.invites))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                val current = _users.value
+                _users.value = if (current is UsersUiState.Loaded) {
+                    current.copy(refreshFailed = true)
+                } else {
+                    UsersUiState.Error(e.message ?: "Failed to load users")
+                }
+            }
+        }
+    }
+
+    /** 保存编辑面板：只发改了的字段；失败时原因留在面板里（InviteSaveState.Error），成功后刷新列表。 */
+    fun saveInvite(update: InviteUpdate) {
+        if (saveJob?.isActive == true) return
+        saveJob = launchSafe {
+            _saveState.value = InviteSaveState.Saving
+            try {
+                val p = store.profile()
+                if (p == null || !p.isOwner) {
+                    _saveState.value = InviteSaveState.Error("Not allowed.")
+                    return@launchSafe
+                }
+                ApiClient.updateInvite(p.token, update)
+                _saveState.value = InviteSaveState.Done
+                usersJob?.cancel()
+                refreshUsers()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: ApiException) {
+                _saveState.value = InviteSaveState.Error(inviteErrorText(e.code, e.reason))
+            } catch (e: Exception) {
+                _saveState.value = InviteSaveState.Error(e.message ?: "Save failed.")
+            }
+        }
+    }
+
+    fun resetSaveState() {
+        _saveState.value = InviteSaveState.Idle
+    }
+
     private companion object {
+        const val EXPIRED_POLL_MS = 60_000L
         const val PROFILE_REFRESH_MIN_MS = 10_000L
         const val STOP_TIMEOUT_MS = 5_000L
         const val RESTART_SETTLE_MS = 500L

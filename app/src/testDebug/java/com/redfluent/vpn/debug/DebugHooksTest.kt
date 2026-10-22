@@ -17,6 +17,17 @@ class DebugHooksTest {
     }
 
     @Test
+    fun followIntervalOverrideIsBoundedAndNumeric() {
+        assertEquals(8_000L, DebugHooks.parseFollowInterval("8000"))
+        assertEquals(8_000L, DebugHooks.parseFollowInterval(" 8000\n"))
+        assertEquals(1_000L, DebugHooks.parseFollowInterval("1000"))
+        assertEquals(600_000L, DebugHooks.parseFollowInterval("600000"))
+        for (bad in listOf(null, "", "abc", "999", "600001", "-5", "8.5", "0")) {
+            assertNull("should be null: $bad", DebugHooks.parseFollowInterval(bad))
+        }
+    }
+
+    @Test
     fun rejectsEverythingElse() {
         val bad = listOf(
             null,

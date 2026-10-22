@@ -2,15 +2,20 @@ package com.redfluent.vpn.api
 
 import com.redfluent.vpn.data.DeviceProfile
 import com.redfluent.vpn.data.Envelope
+import com.redfluent.vpn.data.InviteUpdate
 import com.redfluent.vpn.data.OwnerDevicesResponse
+import com.redfluent.vpn.data.OwnerInvitesResponse
 import com.redfluent.vpn.data.ProfileStatus
 import com.redfluent.vpn.data.REGION_TOKYO
 import com.redfluent.vpn.data.cleanErrorReason
 import com.redfluent.vpn.data.normalizeRegionId
+import com.redfluent.vpn.data.parseAccessInfo
 import com.redfluent.vpn.data.parseOwnerDevices
 import com.redfluent.vpn.data.parseOwnerFlag
+import com.redfluent.vpn.data.parseOwnerInvites
 import com.redfluent.vpn.data.parseRegions
 import com.redfluent.vpn.data.regionConfirmed
+import com.redfluent.vpn.data.toJson
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -18,6 +23,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.put
@@ -29,7 +35,12 @@ import java.io.IOException
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
-class ApiException(val code: Int, val reason: String) : Exception(userMessage(code, reason)) {
+class ApiException(
+    val code: Int,
+    val reason: String,
+    /** 403 "invite expired" 时服务器附带的到期时间（ISO），其它错误为 null。 */
+    val expiresAt: String? = null,
+) : Exception(userMessage(code, reason)) {
     companion object {
         /** 与 iOS 版 APIClient.statusMessage 逐字一致，两端提示语相同。 */
         fun userMessage(code: Int, reason: String): String = when (reason) {
@@ -121,7 +132,8 @@ object ApiClient {
             if (!response.isSuccessful) {
                 // 上游挂了时可能是整页 HTML（Cloudflare 错误页）：界面上只该看到一句短话
                 val jsonError = (obj?.get("error") as? JsonPrimitive)?.contentOrNull
-                throw ApiException(response.code, cleanErrorReason(response.code, jsonError, text))
+                val expiresAt = (obj?.get("expiresAt") as? JsonPrimitive)?.takeIf { it.isString }?.contentOrNull
+                throw ApiException(response.code, cleanErrorReason(response.code, jsonError, text), expiresAt)
             }
             val result = obj ?: throw ApiException(response.code, "Bad response")
 
@@ -169,7 +181,8 @@ object ApiClient {
     }
 
     suspend fun fetchProfile(token: String): ProfileStatus {
-        val env = json.decodeFromJsonElement(Envelope.serializer(), request("GET", "/profile", token = token))
+        val raw = request("GET", "/profile", token = token)
+        val env = json.decodeFromJsonElement(Envelope.serializer(), raw)
         if (!env.ok) throw ApiException(500, env.error ?: "Malformed response")
         return ProfileStatus(
             enabled = env.enabled ?: false,
@@ -182,6 +195,7 @@ object ApiClient {
             expiresAt = env.expiresAt,
             isOwner = parseOwnerFlag(env.isOwner),
             regions = parseRegions(env.regions),
+            access = parseAccessInfo(raw),
         )
     }
 
@@ -191,29 +205,46 @@ object ApiClient {
      * 后端返回的是信封 {ok, profileId, serverRegion, region, configVersion, runtimeConfig, runtimeMeta}，
      * 引擎只认里面的 runtimeConfig。整包喂进去会报 `decode config: json: unknown field "ok"`。
      *
-     * region：东京（默认）完全沿用原请求，不带参数；其它区域带 `?region=<id>`，
-     * 且服务器必须在响应里确认同一个 region，否则抛错——绝不退回东京配置。
+     * region：
+     *  - null（普通用户）：不带参数，区域由服务器按「分配给这个账号的区域」决定，以响应里回显的 region 为准；
+     *  - 东京（owner 选的默认区域）：完全沿用 1.0 的请求，不带参数；
+     *  - 其它区域（owner）：带 `?region=<id>`，且服务器必须在响应里确认同一个 region，否则抛错——绝不退回东京配置。
      */
-    suspend fun fetchRuntimeConfig(token: String, region: String = REGION_TOKYO): RuntimeConfig {
-        val regionId = normalizeRegionId(region).ifEmpty { REGION_TOKYO }
-        val path = if (regionId == REGION_TOKYO) {
+    suspend fun fetchRuntimeConfig(token: String, region: String?): RuntimeConfig {
+        val regionId = region?.let { normalizeRegionId(it).ifEmpty { REGION_TOKYO } }
+        val path = if (regionId == null || regionId == REGION_TOKYO) {
             "/device/runtime-config"
         } else {
             "/device/runtime-config?region=" + URLEncoder.encode(regionId, "UTF-8")
         }
         val env = request("GET", path, token = token)
         val returnedRegion = (env["region"] as? JsonPrimitive)?.contentOrNull
-        if (!regionConfirmed(regionId, returnedRegion)) {
+        if (regionId != null && !regionConfirmed(regionId, returnedRegion)) {
             throw ApiException(502, ApiException.REGION_MISMATCH)
         }
         val cfg = env["runtimeConfig"] as? JsonObject
             ?: throw ApiException(500, "runtimeConfig missing in response")
         val name = (env["serverRegion"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
+        val effectiveId = normalizeRegionId(returnedRegion).ifEmpty { regionId.orEmpty() }
         return RuntimeConfig(
             configJson = adaptForAndroid(cfg).toString(),
-            regionId = normalizeRegionId(returnedRegion).ifEmpty { regionId },
-            regionName = name ?: regionId.replaceFirstChar { it.uppercase() },
+            regionId = effectiveId,
+            regionName = name ?: effectiveId.replaceFirstChar { it.uppercase() },
         )
+    }
+
+    /** Owner 专用：所有邀请码（= 用户）及其区域 / 使用时长。逐条宽松解码。 */
+    suspend fun fetchOwnerInvites(token: String): OwnerInvitesResponse {
+        val resp = parseOwnerInvites(request("GET", "/owner/invites", token = token))
+        if (!resp.ok) throw ApiException(500, resp.error ?: "Malformed response")
+        return resp
+    }
+
+    /** Owner 专用：只发改了的字段（见 [InviteUpdate.toJson]）。失败抛 ApiException，原因在 reason 里。 */
+    suspend fun updateInvite(token: String, update: InviteUpdate) {
+        val resp = request("POST", "/owner/invites/update", update.toJson(), token)
+        val ok = (resp["ok"] as? JsonPrimitive)?.takeIf { !it.isString }?.booleanOrNull ?: false
+        if (!ok) throw ApiException(500, (resp["error"] as? JsonPrimitive)?.contentOrNull ?: "Malformed response")
     }
 
     /** Owner 专用：所有设备 + 当前周期用量。非 owner 的 token 会得到 403。逐台设备宽松解码。 */

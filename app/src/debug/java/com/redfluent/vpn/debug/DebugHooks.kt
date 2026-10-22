@@ -29,6 +29,7 @@ object DebugHooks {
     private const val TAG = "RfvDebugHooks"
     private const val NAME_TOKEN = "rfv-test-token"
     private const val NAME_BASE = "rfv-test-base"
+    private const val NAME_FOLLOW = "rfv-follow-ms"
     private const val EXTRA_TOKEN = "rfv_test_token"
     private const val EXTRA_BASE = "rfv_test_base"
     private const val TMP_DIR = "/data/local/tmp"
@@ -45,6 +46,18 @@ object DebugHooks {
         if (port !in 1..65535) return null
         return "http://10.0.2.2:$port"
     }
+
+    /**
+     * 测试用：把"无感"跟随的轮询间隔缩短（毫秒，1000..600000），读 /data/local/tmp/rfv-follow-ms
+     * 或 <app files>/rfv-follow-ms。没有 / 不合法 → null（用正式的 5 分钟）。
+     */
+    fun followIntervalMs(context: Context): Long? {
+        val raw = readFile(File(TMP_DIR, NAME_FOLLOW)) ?: readFile(File(context.filesDir, NAME_FOLLOW))
+        return parseFollowInterval(raw)
+    }
+
+    internal fun parseFollowInterval(raw: String?): Long? =
+        raw?.trim()?.toLongOrNull()?.takeIf { it in 1_000L..600_000L }
 
     /** Application.onCreate 里调用：只处理 API 地址覆盖（必须赶在任何网络请求之前）。 */
     fun onAppCreate(context: Context) {

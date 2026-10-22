@@ -26,8 +26,18 @@ fun syncProfileFromServer(
     if (current.profileId != requestedProfileId) return null
     if (status.profileId != current.profileId) return null
     val regions = normalizeRegions(status.regions)
+    // 1.2：到期状态与「分配给这个账号的区域名」。响应里没带到期字段（旧后端 / owner）就保持本地原值，
+    // 免得把激活时拿到的到期日冲成空。
+    val access = status.access
     return ProfileSyncResult(
-        profile = current.copy(isOwner = status.isOwner, regions = regions),
+        profile = current.copy(
+            isOwner = status.isOwner,
+            regions = regions,
+            serverRegion = status.serverRegion.ifBlank { current.serverRegion },
+            expiresAt = if (access != null) access.expiresAt else current.expiresAt,
+            daysLeft = if (access != null) access.daysLeft else current.daysLeft,
+            expired = if (access != null) access.expired else current.expired,
+        ),
         region = resolveRegion(storedRegion, regions),
     )
 }
