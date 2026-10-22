@@ -1,10 +1,12 @@
 package com.redfluent.vpn
 
 import android.app.Activity
+import android.content.Intent
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
@@ -15,11 +17,15 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.Modifier
+import androidx.lifecycle.lifecycleScope
+import com.redfluent.vpn.debug.DebugHooks
 import com.redfluent.vpn.ui.AppViewModel
 import com.redfluent.vpn.ui.screens.ActivationScreen
 import com.redfluent.vpn.ui.screens.DashboardScreen
 import com.redfluent.vpn.ui.screens.OnboardingScreen
+import com.redfluent.vpn.ui.screens.UsageScreen
 import com.redfluent.vpn.ui.theme.RedFluentTheme
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
 
@@ -44,6 +50,12 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
+        // 仅 debug 变体：测试用 token 注入。release 里 BuildConfig.DEBUG 恒为 false，
+        // 且 release 的 DebugHooks 是空实现，整段会被 R8 删掉。
+        if (BuildConfig.DEBUG) {
+            lifecycleScope.launch { DebugHooks.onActivityCreate(applicationContext, intent) }
+        }
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             notificationPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
         }
@@ -59,6 +71,10 @@ class MainActivity : ComponentActivity() {
                     val activationError by viewModel.activationError.collectAsState()
                     val inviteCode by viewModel.inviteCode.collectAsState()
                     val needsPermission by viewModel.needsVpnPermission.collectAsState()
+                    val selectedRegion by viewModel.selectedRegion.collectAsState()
+                    val activeRegion by viewModel.activeRegion.collectAsState()
+                    val showUsage by viewModel.showUsage.collectAsState()
+                    val usage by viewModel.usage.collectAsState()
 
                     LaunchedEffect(needsPermission) {
                         if (needsPermission) {
@@ -67,6 +83,11 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
+                    val usageVisible = showUsage && profile?.isOwner == true
+
+                    // 系统返回手势 / 返回键：从 Usage 回到主页
+                    BackHandler(enabled = usageVisible) { viewModel.closeUsage() }
+
                     when {
                         !onboarded -> OnboardingScreen(onDone = viewModel::finishOnboarding)
                         profile == null -> ActivationScreen(
@@ -74,17 +95,40 @@ class MainActivity : ComponentActivity() {
                             error = activationError,
                             onActivate = viewModel::activate,
                         )
+                        usageVisible -> UsageScreen(
+                            state = usage,
+                            onBack = viewModel::closeUsage,
+                            onRefresh = viewModel::refreshUsage,
+                        )
                         else -> DashboardScreen(
                             profile = profile,
                             state = state,
                             error = tunnelError,
                             inviteCode = inviteCode,
+                            selectedRegion = selectedRegion,
+                            activeRegion = activeRegion,
                             onToggle = viewModel::toggleTunnel,
                             onSignOut = viewModel::signOut,
+                            onSelectRegion = viewModel::selectRegion,
+                            onOpenUsage = viewModel::openUsage,
                         )
                     }
                 }
             }
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        // 每次回到前台：刷新 isOwner / regions（内部有节流）
+        viewModel.refreshProfile()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        if (BuildConfig.DEBUG) {
+            setIntent(intent)
+            lifecycleScope.launch { DebugHooks.onActivityCreate(applicationContext, intent) }
         }
     }
 }

@@ -11,10 +11,14 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.BarChart
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.DropdownMenu
@@ -22,7 +26,11 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -32,6 +40,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -40,6 +49,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.redfluent.vpn.data.DeviceProfile
+import com.redfluent.vpn.data.RegionOption
 import com.redfluent.vpn.data.TunnelState
 import com.redfluent.vpn.ui.components.TrafficOrb
 import com.redfluent.vpn.ui.theme.Brand
@@ -52,12 +62,19 @@ fun DashboardScreen(
     state: TunnelState,
     error: String?,
     inviteCode: String?,
+    selectedRegion: String,
+    activeRegion: String?,
     onToggle: () -> Unit,
     onSignOut: () -> Unit,
+    onSelectRegion: (String) -> Unit,
+    onOpenUsage: () -> Unit,
 ) {
     val connected = state == TunnelState.CONNECTED
     val bg = MaterialTheme.colorScheme.background
     val topTint = if (connected) Brand.Success.copy(alpha = 0.18f) else Brand.Primary.copy(alpha = 0.10f)
+    val regions = profile?.regions.orEmpty()
+    // 只有服务器给了不止一个区域（= owner 设备）才出现区域选择；其他人的界面与 1.0 完全相同
+    val multiRegion = regions.size > 1
 
     Box(
         modifier = Modifier
@@ -67,11 +84,17 @@ fun DashboardScreen(
         Column(
             modifier = Modifier
                 .fillMaxSize()
+                // 1.0 没处理状态栏高度，顶栏会和系统状态栏叠在一起；Usage 按钮加进来后必须让开
+                .statusBarsPadding()
                 .verticalScroll(rememberScrollState())
                 .padding(horizontal = Spacing.lg),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            TopBar(onSignOut = onSignOut)
+            TopBar(
+                showUsage = profile?.isOwner == true,
+                onOpenUsage = onOpenUsage,
+                onSignOut = onSignOut,
+            )
 
             TrafficOrb(
                 state = state,
@@ -95,9 +118,21 @@ fun DashboardScreen(
             Spacer(Modifier.height(Spacing.lg))
 
             InfoCard("Server") {
+                if (multiRegion) {
+                    RegionPicker(regions = regions, selected = selectedRegion, onSelect = onSelectRegion)
+                }
                 Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
                     Text("Region", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 15.sp)
-                    Text(profile?.serverRegion.orEmpty().ifBlank { "—" }, fontSize = 15.sp)
+                    Text(
+                        regionShown(
+                            profile = profile,
+                            multiRegion = multiRegion,
+                            connected = connected,
+                            selectedRegion = selectedRegion,
+                            activeRegion = activeRegion,
+                        ),
+                        fontSize = 15.sp,
+                    )
                 }
                 Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
                     Text("Config", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 15.sp)
@@ -151,7 +186,7 @@ fun DashboardScreen(
 }
 
 @Composable
-private fun TopBar(onSignOut: () -> Unit) {
+private fun TopBar(showUsage: Boolean, onOpenUsage: () -> Unit, onSignOut: () -> Unit) {
     var menuOpen by remember { mutableStateOf(false) }
     Row(
         modifier = Modifier
@@ -161,21 +196,70 @@ private fun TopBar(onSignOut: () -> Unit) {
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text("RedFluent VPN", fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
-        Box {
-            IconButton(onClick = { menuOpen = true }) {
-                Icon(Icons.Filled.MoreVert, contentDescription = "Menu")
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            // Owner 才有的入口
+            if (showUsage) {
+                TextButton(onClick = onOpenUsage) {
+                    Icon(Icons.Filled.BarChart, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(Spacing.xs))
+                    Text("Usage")
+                }
             }
-            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                DropdownMenuItem(
-                    text = { Text("Sign out") },
-                    onClick = {
-                        menuOpen = false
-                        onSignOut()
-                    },
-                )
+            Box {
+                IconButton(onClick = { menuOpen = true }) {
+                    Icon(Icons.Filled.MoreVert, contentDescription = "Menu")
+                }
+                DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                    DropdownMenuItem(
+                        text = { Text("Sign out") },
+                        onClick = {
+                            menuOpen = false
+                            onSignOut()
+                        },
+                    )
+                }
             }
         }
     }
+}
+
+/** Owner 专用的区域切换。只在服务器提供多个区域时出现。 */
+@Composable
+private fun RegionPicker(regions: List<RegionOption>, selected: String, onSelect: (String) -> Unit) {
+    SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+        regions.forEachIndexed { index, region ->
+            SegmentedButton(
+                selected = region.id == selected,
+                onClick = { onSelect(region.id) },
+                shape = SegmentedButtonDefaults.itemShape(index, regions.size),
+                colors = SegmentedButtonDefaults.colors(
+                    activeContainerColor = Brand.Primary.copy(alpha = 0.16f),
+                    activeContentColor = Brand.Primary,
+                    activeBorderColor = Brand.Primary,
+                    inactiveContainerColor = Color.Transparent,
+                    inactiveContentColor = MaterialTheme.colorScheme.onSurface,
+                ),
+                label = { Text(region.label) },
+            )
+        }
+    }
+}
+
+/**
+ * "Server" 卡片里 Region 一行显示什么：
+ *  - 单区域（所有非 owner）：和 1.0 一样，显示 profile 里的 serverRegion；
+ *  - 多区域：已连接时显示隧道真正连着的区域（服务器确认的），没连时显示当前选中的区域。
+ */
+private fun regionShown(
+    profile: DeviceProfile?,
+    multiRegion: Boolean,
+    connected: Boolean,
+    selectedRegion: String,
+    activeRegion: String?,
+): String {
+    if (!multiRegion) return profile?.serverRegion.orEmpty().ifBlank { "—" }
+    if (connected && !activeRegion.isNullOrBlank()) return activeRegion
+    return profile?.regions?.firstOrNull { it.id == selectedRegion }?.label ?: "—"
 }
 
 @Composable

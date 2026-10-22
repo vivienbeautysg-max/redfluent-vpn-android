@@ -2,19 +2,26 @@ package com.redfluent.vpn.api
 
 import com.redfluent.vpn.data.DeviceProfile
 import com.redfluent.vpn.data.Envelope
+import com.redfluent.vpn.data.OwnerDevicesResponse
 import com.redfluent.vpn.data.ProfileStatus
+import com.redfluent.vpn.data.REGION_TOKYO
+import com.redfluent.vpn.data.normalizeRegions
+import com.redfluent.vpn.data.regionConfirmed
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.put
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
+import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
 class ApiException(val code: Int, val reason: String) : Exception(userMessage(code, reason)) {
@@ -31,10 +38,28 @@ class ApiException(val code: Int, val reason: String) : Exception(userMessage(co
                 "This invite has reached its device limit. Ask the owner to raise the limit or revoke an old device."
             "owner device cannot be revoked here" ->
                 "Owner devices are protected and cannot be revoked here."
+            // 1.1：区域相关
+            "region not allowed" ->
+                "This region is not available for this device."
+            "region unavailable" ->
+                "This region is unavailable right now."
+            "unknown region" ->
+                "Unknown region."
+            REGION_MISMATCH ->
+                "The server did not confirm the region."
             else -> "Server error $code: $reason"
         }
+
+        const val REGION_MISMATCH = "region mismatch"
     }
 }
+
+/** 一次取回的运行配置，连同服务器确认的区域，用于界面显示「实际在用哪个区域」。 */
+data class RuntimeConfig(
+    val configJson: String,
+    val regionId: String,
+    val regionName: String,
+)
 
 object ApiClient {
 
@@ -124,6 +149,8 @@ object ApiClient {
             configVersion = env.configVersion.orEmpty(),
             monthlyQuotaGB = env.monthlyQuotaGB,
             expiresAt = env.expiresAt,
+            isOwner = env.isOwner ?: false,
+            regions = normalizeRegions(env.regions),
         )
     }
 
@@ -137,20 +164,51 @@ object ApiClient {
             serverRegion = env.serverRegion.orEmpty(),
             routingMode = env.routingMode.orEmpty(),
             monthlyQuotaGB = env.monthlyQuotaGB,
+            configVersion = env.configVersion.orEmpty(),
+            expiresAt = env.expiresAt,
+            isOwner = env.isOwner ?: false,
+            regions = normalizeRegions(env.regions),
         )
     }
 
     /**
      * 取本设备专属的 sing-box 运行配置（每台设备独立 UUID，吊销才真正有效）。
      *
-     * 后端返回的是信封 {ok, profileId, serverRegion, configVersion, runtimeConfig, runtimeMeta}，
+     * 后端返回的是信封 {ok, profileId, serverRegion, region, configVersion, runtimeConfig, runtimeMeta}，
      * 引擎只认里面的 runtimeConfig。整包喂进去会报 `decode config: json: unknown field "ok"`。
+     *
+     * region：东京（默认）完全沿用原请求，不带参数；其它区域带 `?region=<id>`，
+     * 且服务器必须在响应里确认同一个 region，否则抛错——绝不退回东京配置。
      */
-    suspend fun fetchRuntimeConfig(token: String): String {
-        val env = request("GET", "/device/runtime-config", token = token)
+    suspend fun fetchRuntimeConfig(token: String, region: String = REGION_TOKYO): RuntimeConfig {
+        val path = if (region == REGION_TOKYO) {
+            "/device/runtime-config"
+        } else {
+            "/device/runtime-config?region=" + URLEncoder.encode(region, "UTF-8")
+        }
+        val env = request("GET", path, token = token)
+        val returnedRegion = (env["region"] as? JsonPrimitive)?.contentOrNull
+        if (!regionConfirmed(region, returnedRegion)) {
+            throw ApiException(502, ApiException.REGION_MISMATCH)
+        }
         val cfg = env["runtimeConfig"] as? JsonObject
             ?: throw ApiException(500, "runtimeConfig missing in response")
-        return adaptForAndroid(cfg).toString()
+        val name = (env["serverRegion"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
+        return RuntimeConfig(
+            configJson = adaptForAndroid(cfg).toString(),
+            regionId = returnedRegion?.trim()?.lowercase() ?: region,
+            regionName = name ?: region.replaceFirstChar { it.uppercase() },
+        )
+    }
+
+    /** Owner 专用：所有设备 + 当前周期用量。非 owner 的 token 会得到 403。 */
+    suspend fun fetchOwnerDevices(token: String): OwnerDevicesResponse {
+        val resp = json.decodeFromJsonElement(
+            OwnerDevicesResponse.serializer(),
+            request("GET", "/owner/devices", token = token),
+        )
+        if (!resp.ok) throw ApiException(500, resp.error ?: "Malformed response")
+        return resp
     }
 
     /**

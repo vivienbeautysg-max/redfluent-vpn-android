@@ -35,6 +35,7 @@ class RedFluentVpnService :
         const val ACTION_START = "com.redfluent.vpn.START"
         const val ACTION_STOP = "com.redfluent.vpn.STOP"
         const val EXTRA_CONFIG = "config"
+        const val EXTRA_REGION_NAME = "region_name"
 
         private const val CHANNEL_ID = "vpn_status"
         private const val NOTIFICATION_ID = 1001
@@ -45,6 +46,21 @@ class RedFluentVpnService :
 
         private val _lastError = MutableStateFlow<String?>(null)
         val lastError = _lastError.asStateFlow()
+
+        // 隧道真正连着的区域名（服务器确认的）；没连上时为 null。
+        private val _activeRegion = MutableStateFlow<String?>(null)
+        val activeRegion = _activeRegion.asStateFlow()
+
+        /**
+         * 连接在拿到配置之前就失败了（例如非默认区域取配置失败）。
+         * 服务还没起，所以由调用方通过这里把失败显示出来——界面看到 ERROR + 原因，
+         * 而不是什么都没发生，更不会悄悄连到别的区域。
+         */
+        fun reportFailure(message: String) {
+            _lastError.value = message
+            _activeRegion.value = null
+            _state.value = TunnelState.ERROR
+        }
     }
 
     override val androidContext: Context get() = this
@@ -69,8 +85,9 @@ class RedFluentVpnService :
                     fail("Missing tunnel configuration")
                     return START_NOT_STICKY
                 }
+                val regionName = intent.getStringExtra(EXTRA_REGION_NAME)
                 startForegroundSafely()
-                scope.launch { startTunnel(config) }
+                scope.launch { startTunnel(config, regionName) }
             }
         }
         // 故意不用 START_STICKY：系统自动重启会造出「服务活着但隧道已死」的假绿状态。
@@ -78,7 +95,7 @@ class RedFluentVpnService :
         return START_NOT_STICKY
     }
 
-    private fun startTunnel(rawConfig: String) {
+    private fun startTunnel(rawConfig: String, regionName: String?) {
         _state.value = TunnelState.CONNECTING
         _lastError.value = null
         try {
@@ -87,6 +104,7 @@ class RedFluentVpnService :
             server.start()
             server.startOrReloadService(configJson, OverrideOptions())
             commandServer = server
+            _activeRegion.value = regionName
             _state.value = TunnelState.CONNECTED
             updateNotification("Connected")
         } catch (e: Exception) {
@@ -122,6 +140,7 @@ class RedFluentVpnService :
         commandServer = null
         runCatching { tunFd?.close() }
         tunFd = null
+        _activeRegion.value = null
         _state.value = TunnelState.DISCONNECTED
         stopForegroundCompat()
         stopSelf()
@@ -129,6 +148,7 @@ class RedFluentVpnService :
 
     private fun fail(message: String) {
         _lastError.value = message
+        _activeRegion.value = null
         _state.value = TunnelState.ERROR
         runCatching { commandServer?.close() }
         commandServer = null

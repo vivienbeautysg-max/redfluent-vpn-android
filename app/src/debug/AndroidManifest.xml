@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- 仅 debug：允许明文 HTTP 访问模拟器宿主 10.0.2.2（本机 mock 后端）。release 没有这个文件。 -->
+    <application android:networkSecurityConfig="@xml/debug_network_security" />
+</manifest>

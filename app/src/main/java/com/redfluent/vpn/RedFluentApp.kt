@@ -3,6 +3,7 @@ package com.redfluent.vpn
 import android.app.Application
 import android.os.Build
 import com.redfluent.vpn.data.ProfileStore
+import com.redfluent.vpn.debug.DebugHooks
 import io.nekohasekai.libbox.Libbox
 import io.nekohasekai.libbox.SetupOptions
 import java.io.File
@@ -19,6 +20,8 @@ class RedFluentApp : Application() {
     override fun onCreate() {
         super.onCreate()
         instance = this
+        // 仅 debug 变体：允许测试时把 API 指到本机 mock。release 里是空实现。
+        if (BuildConfig.DEBUG) DebugHooks.onAppCreate(this)
         setupEngine()
     }
 

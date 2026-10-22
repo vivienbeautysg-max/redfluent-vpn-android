@@ -27,6 +27,7 @@ class ProfileStore(private val context: Context) {
         val ONBOARDED = booleanPreferencesKey("onboarding_done")
         val WANT_CONNECTED = booleanPreferencesKey("want_connected")
         val LAST_INVITE = stringPreferencesKey("last_invite_code")
+        val REGION = stringPreferencesKey("selected_region")
     }
 
     val profileFlow: Flow<DeviceProfile?> = context.dataStore.data.map { prefs ->
@@ -44,15 +45,35 @@ class ProfileStore(private val context: Context) {
      */
     val lastInviteFlow: Flow<String?> = context.dataStore.data.map { it[Keys.LAST_INVITE] }
 
+    /** 用户选的区域；没选过 = 东京。 */
+    val selectedRegionFlow: Flow<String> = context.dataStore.data.map {
+        it[Keys.REGION]?.takeIf { id -> id.isNotBlank() } ?: REGION_TOKYO
+    }
+
     suspend fun profile(): DeviceProfile? = profileFlow.first()
 
     suspend fun saveProfile(profile: DeviceProfile) {
         context.dataStore.edit { it[Keys.PROFILE] = json.encodeToString(DeviceProfile.serializer(), profile) }
     }
 
+    /**
+     * 原子地「读 → 改 → 写」当前 profile。
+     * 刷新资料与 token 滑动续期可能同时发生；各自先读后写会互相覆盖（旧 token 把新 token 冲掉），
+     * 所以两边都必须走这里。没有 profile 时什么也不做。
+     */
+    suspend fun updateProfile(transform: (DeviceProfile) -> DeviceProfile) {
+        context.dataStore.edit { prefs ->
+            val current = prefs[Keys.PROFILE]
+                ?.let { runCatching { json.decodeFromString<DeviceProfile>(it) }.getOrNull() }
+                ?: return@edit
+            prefs[Keys.PROFILE] = json.encodeToString(DeviceProfile.serializer(), transform(current))
+        }
+    }
+
     suspend fun clearProfile() {
         context.dataStore.edit {
             it.remove(Keys.PROFILE)
+            it.remove(Keys.REGION)
             it[Keys.WANT_CONNECTED] = false
         }
     }
@@ -67,6 +88,26 @@ class ProfileStore(private val context: Context) {
 
     suspend fun saveInviteCode(code: String) {
         context.dataStore.edit { it[Keys.LAST_INVITE] = code }
+    }
+
+    suspend fun selectedRegion(): String = selectedRegionFlow.first()
+
+    suspend fun setSelectedRegion(id: String) {
+        context.dataStore.edit { it[Keys.REGION] = id }
+    }
+
+    /**
+     * 服务器不再提供已选区域时（被关闭、设备不再是 owner），静默把选择退回东京。
+     * 返回最终生效的区域。
+     */
+    suspend fun reconcileRegion(offered: List<RegionOption>): String {
+        var result = REGION_TOKYO
+        context.dataStore.edit { prefs ->
+            val current = prefs[Keys.REGION]
+            result = resolveRegion(current, offered)
+            if (current != null && current != result) prefs[Keys.REGION] = result
+        }
+        return result
     }
 
     /** 设备公开标识：本机随机生成一次后固定，不含任何硬件标识符。 */

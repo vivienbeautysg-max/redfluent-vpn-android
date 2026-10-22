@@ -21,8 +21,8 @@ android {
         applicationId = "com.redfluent.vpn"
         minSdk = 24
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
 
         // 真机一律 arm64。带上另外三种架构会让 APK 从 ~50MB 涨到 181MB，
         // 而 x86/x86_64 只有模拟器用得上。
@@ -87,6 +87,8 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
     debugImplementation("androidx.compose.ui:ui-tooling")
+
+    testImplementation("junit:junit:4.13.2")
 
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
