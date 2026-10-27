@@ -2,16 +2,30 @@ package com.redfluent.vpn.vpn
 
 import android.content.Context
 import android.net.ConnectivityManager
+import android.net.DnsResolver
 import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.os.CancellationSignal
 import android.os.Handler
 import android.os.Looper
 import android.os.Build
+import android.system.ErrnoException
 import android.system.OsConstants
+import androidx.annotation.RequiresApi
 import io.nekohasekai.libbox.ConnectionOwner
+import io.nekohasekai.libbox.ExchangeContext
+import io.nekohasekai.libbox.Func
 import io.nekohasekai.libbox.InterfaceUpdateListener
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.asExecutor
+import java.io.IOException
+import java.net.InetAddress
+import java.net.UnknownHostException
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import io.nekohasekai.libbox.Libbox
 import io.nekohasekai.libbox.LocalDNSTransport
 import io.nekohasekai.libbox.NeighborUpdateListener
@@ -71,7 +85,8 @@ interface PlatformBridge : PlatformInterface {
         destinationPort: Int,
     ): ConnectionOwner = throw UnsupportedOperationException("per-app proxy not supported")
 
-    override fun localDNSTransport(): LocalDNSTransport? = null
+    /** 1.3：配置里 type 为 local 的 DNS 服务器由系统解析器在底层网络上查（见 [LocalResolver]）。 */
+    override fun localDNSTransport(): LocalDNSTransport? = LocalResolver
 
     /** 不申请定位权限，因此拿不到也不需要 WiFi 状态。 */
     override fun readWIFIState(): WIFIState? = null
@@ -168,6 +183,106 @@ interface PlatformBridge : PlatformInterface {
 }
 
 /**
+ * 1.3：sing-box 配置里 type 为 `local` 的 DNS 服务器，在 Android 上必须由平台提供（iOS 由系统解析）。
+ * 不提供时引擎退回 Go 自带解析，读不到 /etc/resolv.conf，就去问 [::1]:53 → connection refused，
+ * 凡是走 local 的查询全部失败（实测：已连上，但 api.ipify.org 解析不了，网页打不开）。
+ * 照官方 sing-box for Android 的做法：用系统 DnsResolver 在底层（非 VPN）网络上查；Android 10 以下只能按域名查。
+ * 本 app 自己的流量不进隧道（addDisallowedApplication），所以这些查询不会绕回隧道。
+ */
+internal object LocalResolver : LocalDNSTransport {
+
+    private const val RCODE_NXDOMAIN = 3
+    private const val TIMEOUT_SECONDS = 10L
+    private val executor = Dispatchers.IO.asExecutor()
+
+    override fun raw(): Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+
+    /** Android 10+：原样转发整条 DNS 报文（raw() 为 true 时引擎才会调它）。 */
+    @RequiresApi(Build.VERSION_CODES.Q)
+    override fun exchange(ctx: ExchangeContext, message: ByteArray) {
+        await(ctx) { signal, done ->
+            DnsResolver.getInstance().rawQuery(
+                DefaultNetworkMonitor.network(), message, DnsResolver.FLAG_NO_RETRY, executor, signal,
+                object : DnsResolver.Callback<ByteArray> {
+                    override fun onAnswer(answer: ByteArray, rcode: Int) {
+                        if (rcode == 0) ctx.rawSuccess(answer) else ctx.errorCode(rcode)
+                        done(null)
+                    }
+
+                    override fun onError(error: DnsResolver.DnsException) = done(error)
+                },
+            )
+        }
+    }
+
+    /** 按域名查，返回换行分隔的地址。network 以 4 / 6 结尾时只查 A / AAAA。 */
+    override fun lookup(ctx: ExchangeContext, network: String, domain: String) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            lookupWithDnsResolver(ctx, network, domain)
+            return
+        }
+        val answer = try {
+            DefaultNetworkMonitor.network()?.getAllByName(domain) ?: InetAddress.getAllByName(domain)
+        } catch (e: UnknownHostException) {
+            ctx.errorCode(RCODE_NXDOMAIN)
+            return
+        }
+        ctx.success(answer.mapNotNull { it.hostAddress }.joinToString("\n"))
+    }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private fun lookupWithDnsResolver(ctx: ExchangeContext, network: String, domain: String) {
+        await(ctx) { signal, done ->
+            val callback = object : DnsResolver.Callback<List<InetAddress>> {
+                override fun onAnswer(answer: List<InetAddress>, rcode: Int) {
+                    if (rcode == 0) ctx.success(answer.mapNotNull { it.hostAddress }.joinToString("\n")) else ctx.errorCode(rcode)
+                    done(null)
+                }
+
+                override fun onError(error: DnsResolver.DnsException) = done(error)
+            }
+            val net = DefaultNetworkMonitor.network()
+            val type = when {
+                network.endsWith("4") -> DnsResolver.TYPE_A
+                network.endsWith("6") -> DnsResolver.TYPE_AAAA
+                else -> null
+            }
+            if (type != null) {
+                DnsResolver.getInstance().query(net, domain, type, DnsResolver.FLAG_NO_RETRY, executor, signal, callback)
+            } else {
+                DnsResolver.getInstance().query(net, domain, DnsResolver.FLAG_NO_RETRY, executor, signal, callback)
+            }
+        }
+    }
+
+    /**
+     * 引擎在自己的线程上同步调用：发出查询，等回调（最多 10 秒）。
+     * 系统报的 errno 原样交给引擎；其它错误抛出去，由引擎当作这次查询失败。
+     */
+    private fun await(ctx: ExchangeContext, start: (CancellationSignal, (Exception?) -> Unit) -> Unit) {
+        val latch = CountDownLatch(1)
+        val failure = AtomicReference<Exception?>(null)
+        val signal = CancellationSignal()
+        ctx.onCancel(Func { signal.cancel() })
+        start(signal) { e ->
+            failure.set(e)
+            latch.countDown()
+        }
+        if (latch.await(TIMEOUT_SECONDS, TimeUnit.SECONDS).not()) {
+            signal.cancel()
+            throw IOException("local DNS timed out")
+        }
+        val e = failure.get() ?: return
+        val errno = (e.cause as? ErrnoException)?.errno
+        if (errno != null) ctx.errnoCode(errno) else throw e
+    }
+}
+
+/** 选引擎用的底层网络：系统默认网络能用就用它；否则（默认网络是 VPN 自己）取第一个能用的；都不行为 null。纯逻辑，JVM 测试覆盖。 */
+internal fun <T> pickUnderlying(active: T?, all: List<T>, usable: (T) -> Boolean): T? =
+    active?.takeIf(usable) ?: all.firstOrNull(usable)
+
+/**
  * 默认网络监视器。网络切换（WiFi↔移动数据）时通知引擎重建连接，
  * 否则切换后隧道会静默失效——用户以为还连着，其实已经不通。
  */
@@ -191,6 +306,7 @@ object DefaultNetworkMonitor {
                 notify(cm, network, listener)
 
             override fun onLost(network: Network) {
+                if (current == network) current = null
                 runCatching { listener.updateDefaultInterface("", -1, false, false) }
             }
         }
@@ -215,21 +331,53 @@ object DefaultNetworkMonitor {
         }.onFailure {
             runCatching { cm.registerDefaultNetworkCallback(cb) }
         }
+
+        // 1.3：回调是异步的（主线程稍后才到）。引擎一启动就会拨号——东京双栈后 proxy 是 urltest 组，
+        // 启动时就要测速、下载 rule-set——这时还不知道出网口就报 "no available network interface"，整个启动失败。
+        // 所以在返回前先同步报一次当前的底层网络（不是 VPN 自己）；之后的变化仍由上面的回调负责。
+        currentUnderlying(cm)?.let { report(cm, it, listener) }
+    }
+
+    /** 当前可上网、不受限、且不是 VPN 的网络：优先系统默认网络，否则任取一个符合条件的。 */
+    @Suppress("DEPRECATION") // allNetworks：默认网络是 VPN 自己（热重载时）才需要，API 24 起都可用
+    private fun currentUnderlying(cm: ConnectivityManager): Network? {
+        fun usable(n: Network): Boolean {
+            val c = cm.getNetworkCapabilities(n) ?: return false
+            return c.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                c.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED) &&
+                c.hasTransport(NetworkCapabilities.TRANSPORT_VPN).not()
+        }
+        val active = runCatching { cm.activeNetwork }.getOrNull()
+        val all = runCatching { cm.allNetworks.toList() }.getOrDefault(emptyList())
+        return pickUnderlying(active, all) { usable(it) }
     }
 
     private fun notify(cm: ConnectivityManager, network: Network, listener: InterfaceUpdateListener) {
-        val lp = cm.getLinkProperties(network) ?: return
+        if (report(cm, network, listener)) runCatching { onNetworkChanged?.invoke() }
+    }
+
+    /** 把这个网络作为默认出网口告诉引擎；拿不到接口名时什么也不做，返回 false。 */
+    private fun report(cm: ConnectivityManager, network: Network, listener: InterfaceUpdateListener): Boolean {
+        val lp = cm.getLinkProperties(network) ?: return false
         val caps = cm.getNetworkCapabilities(network)
-        val name = lp.interfaceName ?: return
+        val name = lp.interfaceName ?: return false
         val index = runCatching { NetworkInterface.getByName(name)?.index ?: -1 }.getOrDefault(-1)
         val isExpensive = caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) == false
+        current = network
         runCatching { listener.updateDefaultInterface(name, index, isExpensive, false) }
-        runCatching { onNetworkChanged?.invoke() }
+        return true
     }
+
+    /** 最近一次报给引擎的底层网络（[LocalResolver] 在它上面查 DNS）；还没有为 null（= 本 app 的默认网络，本就不进隧道）。 */
+    @Volatile
+    private var current: Network? = null
+
+    fun network(): Network? = current
 
     fun stop(context: Context) {
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
         callback?.let { runCatching { cm.unregisterNetworkCallback(it) } }
         callback = null
+        current = null
     }
 }
