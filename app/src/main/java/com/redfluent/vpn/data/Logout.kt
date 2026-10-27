@@ -52,8 +52,8 @@ fun partialLogoutText(failed: Int, total: Int): String =
 
 // ---- 设备这一侧：被登出后回到激活页 ------------------------------------------------------------
 
-/** 设备被登出后激活页上显示的一句话（不是吓人的错误）。 */
-const val SIGNED_OUT_NOTICE = "Signed out. Enter your invite code to reconnect."
+/** 设备被登出后激活页上显示的一句话（不是吓人的错误；1.3 起与 iOS 一样只写 "Signed out"，下面就是输入框）。 */
+const val SIGNED_OUT_NOTICE = "Signed out"
 
 /**
  * /profile 的结果是否说明"这台设备已被登出"：

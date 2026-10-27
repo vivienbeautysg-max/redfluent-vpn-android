@@ -163,12 +163,13 @@ sealed interface DurationChange {
 }
 
 /**
- * 要发给 /owner/invites/update 的内容。
- * 后端每次都会完整读取 code / newCode / label / maxDevices / monthlyQuotaGB / enabled（缺了就用默认值甚至 400 "label required"，
- * 不会"保持不变"），所以这六个字段永远带上这条邀请码【当前】的值；region / durationDays 只在改了时才带。
+ * 要发给 /owner/invites/update 的内容（1.3 个人页）。
+ * code / newCode / label / maxDevices / monthlyQuotaGB / enabled 这六个字段每次都完整带上（旧笔记：只发部分字段曾经把保存弄坏过；
+ * 现在的后端对没发的字段保持不变，但我们仍然发完整的）。region / durationDays 只在改了时才带。
  */
 data class InviteUpdate(
     val code: String,
+    val newCode: String,
     val label: String,
     val maxDevices: Int,
     val monthlyQuotaGB: Int,
@@ -180,51 +181,56 @@ data class InviteUpdate(
 }
 
 /**
- * 比较「原来」和「现在选的」，只把真正改了的 region / durationDays 放进去，其余字段原样带回服务器当前的值；
- * 什么都没改 → null（保存按钮保持禁用）。
- * owner 的邀请码什么都不能改；审核码只能改区域。
- * 列表里没给出当前的 label / maxDevices / monthlyQuotaGB（旧后端、坏数据）→ null：宁可不能保存，也不发会把它们冲成默认值的请求。
+ * 比较「原来」和个人页里改成的样子：
+ *  - owner 自己的邀请码：邀请码不能改、不能暂停（newCode = code，enabled 保持原值），也不发 region / durationDays；
+ *  - Apple Review 邀请码：不发 durationDays；
+ *  - 后端没给区域 / 时长信息（旧后端，invite.region == null）：不发 region / durationDays；
+ *  - 什么都没改 → null（保存按钮不出现）。
  */
-fun buildInviteUpdate(
-    original: OwnerInvite,
-    region: String,
-    access: AccessChoice,
-    kind: ProtectedKind? = null,
-): InviteUpdate? {
-    if (kind == ProtectedKind.OWNER) return null
-    if (original.label.isBlank()) return null
-    val maxDevices = original.maxDevices?.takeIf { it >= 1 } ?: return null
-    val monthlyQuotaGB = original.monthlyQuotaGB?.takeIf { it >= 1 } ?: return null
-    val newRegion = normalizeRegionId(region).takeIf { it.isNotEmpty() && it != original.regionId }
-    val duration: DurationChange = if (kind == ProtectedKind.REVIEW) {
+fun buildInviteUpdate(original: OwnerInvite, edit: PersonEdit, kind: ProtectedKind? = null): InviteUpdate? {
+    val owner = kind == ProtectedKind.OWNER
+    // 个人页会去掉首尾空格；用户没改的名字 / 邀请码按服务器原样发回去（不因为一个空格就算「改了」）
+    val label = if (edit.label == original.label.trim()) original.label else edit.label
+    val newCode = if (owner || edit.code == original.code.trim()) original.code else edit.code
+    val enabled = if (owner) original.enabled else edit.enabled
+    val accessKnown = original.region != null && owner.not()
+    val newRegion = if (accessKnown) {
+        edit.region?.let { normalizeRegionId(it) }?.takeIf { it.isNotEmpty() && it != original.regionId }
+    } else {
+        null
+    }
+    val duration: DurationChange = if (accessKnown.not() || kind == ProtectedKind.REVIEW) {
         DurationChange.Unchanged
     } else {
-        when (access) {
-            AccessChoice.NoLimit ->
-                if (original.durationDays == null) DurationChange.Unchanged else DurationChange.Clear
+        when (val a = edit.access) {
+            null -> DurationChange.Unchanged
+            AccessChoice.NoLimit -> if (original.durationDays == null) DurationChange.Unchanged else DurationChange.Clear
             is AccessChoice.Days -> when {
-                access.days !in MIN_DURATION_DAYS..MAX_DURATION_DAYS -> DurationChange.Unchanged
-                access.days == original.durationDays -> DurationChange.Unchanged
-                else -> DurationChange.Set(access.days)
+                a.days < MIN_DURATION_DAYS || a.days > MAX_DURATION_DAYS -> return null
+                a.days == original.durationDays -> DurationChange.Unchanged
+                else -> DurationChange.Set(a.days)
             }
         }
     }
-    if (newRegion == null && duration == DurationChange.Unchanged) return null
+    val unchanged = newCode == original.code && label == original.label &&
+        edit.maxDevices == original.maxDevices && edit.monthlyQuotaGB == original.monthlyQuotaGB &&
+        enabled == original.enabled && newRegion == null && duration == DurationChange.Unchanged
+    if (unchanged) return null
     return InviteUpdate(
         code = original.code,
-        label = original.label,
-        maxDevices = maxDevices,
-        monthlyQuotaGB = monthlyQuotaGB,
-        enabled = original.enabled,
+        newCode = newCode,
+        label = label,
+        maxDevices = edit.maxDevices,
+        monthlyQuotaGB = edit.monthlyQuotaGB,
+        enabled = enabled,
         region = newRegion,
         duration = duration,
     )
 }
 
-/** newCode = code：不改邀请码（与 iOS 发的六个字段一致；后端没给 newCode 时本来就等于 code）。 */
 fun InviteUpdate.toJson(): JsonObject = buildJsonObject {
     put("code", code)
-    put("newCode", code)
+    put("newCode", newCode)
     put("label", label)
     put("maxDevices", maxDevices)
     put("monthlyQuotaGB", monthlyQuotaGB)

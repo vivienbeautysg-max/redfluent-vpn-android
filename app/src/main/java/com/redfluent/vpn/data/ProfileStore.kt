@@ -50,6 +50,11 @@ class ProfileStore(private val context: Context) {
         normalizeRegionId(it[Keys.REGION]).ifEmpty { REGION_TOKYO }
     }
 
+    /** 1.3：app 内选的明暗（默认浅色，不跟随系统）。退出登录不清掉它。 */
+    val appearanceFlow: Flow<Appearance> = appearanceFlow(context.dataStore)
+
+    suspend fun setAppearance(appearance: Appearance) = saveAppearance(context.dataStore, appearance)
+
     suspend fun profile(): DeviceProfile? = profileFlow.first()
 
     suspend fun saveProfile(profile: DeviceProfile) {
@@ -76,7 +81,13 @@ class ProfileStore(private val context: Context) {
             it.remove(Keys.REGION)
             it[Keys.WANT_CONNECTED] = false
         }
+        saveIpv4Blocked(context.dataStore, null)
     }
+
+    /** 上一次运行配置里的 runtimeMeta.ipv4Blocked（没有 = null），主页 IPv6 提示用。 */
+    val ipv4BlockedFlow: Flow<Boolean?> = ipv4BlockedFlow(context.dataStore)
+
+    suspend fun setIpv4Blocked(value: Boolean?) = saveIpv4Blocked(context.dataStore, value)
 
     suspend fun setOnboarded() {
         context.dataStore.edit { it[Keys.ONBOARDED] = true }

@@ -1,6 +1,11 @@
 package com.redfluent.vpn.api
 
+import com.redfluent.vpn.data.DeletedInvitesResponse
 import com.redfluent.vpn.data.DeviceProfile
+import com.redfluent.vpn.data.DeviceQuota
+import com.redfluent.vpn.data.parseDeletedInvites
+import com.redfluent.vpn.data.parseDeviceQuota
+import com.redfluent.vpn.data.parseIpv4Blocked
 import com.redfluent.vpn.data.Envelope
 import com.redfluent.vpn.data.InviteUpdate
 import com.redfluent.vpn.data.OwnerDevicesResponse
@@ -76,11 +81,20 @@ data class RuntimeConfig(
     val configJson: String,
     val regionId: String,
     val regionName: String,
+    /** runtimeMeta.ipv4Blocked（东京 IPv4 在中国被封时为 true）；后端没给为 null。只用于主页的 IPv6 提示。 */
+    val ipv4Blocked: Boolean? = null,
 )
 
 object ApiClient {
 
     const val DEFAULT_BASE = "https://vpn-api.redfluent.com"
+
+    /**
+     * 1.3：每次取运行配置都告诉后端本客户端能处理什么。local-dns = 配置里 type=local 的 DNS 服务器能用
+     * （由 PlatformBridge.LocalResolver 提供）；1.2.1 及更早不带这个头，后端只给它们 DoH。
+     */
+    const val CAPS_HEADER = "X-RFV-Caps"
+    const val CAPS = "local-dns"
 
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
     private val jsonMedia = "application/json; charset=utf-8".toMediaType()
@@ -111,9 +125,11 @@ object ApiClient {
         path: String,
         body: JsonObject? = null,
         token: String? = null,
+        headers: Map<String, String> = emptyMap(),
     ): JsonObject = withContext(Dispatchers.IO) {
         val builder = Request.Builder().url("$base$path")
         if (token != null) builder.header("Authorization", "Bearer $token")
+        headers.forEach { (k, v) -> builder.header(k, v) }
         when (method) {
             "POST" -> builder.post((body?.toString() ?: "{}").toRequestBody(jsonMedia))
             else -> builder.get()
@@ -205,7 +221,7 @@ object ApiClient {
         } else {
             "/device/runtime-config?region=" + URLEncoder.encode(regionId, "UTF-8")
         }
-        val env = request("GET", path, token = token)
+        val env = request("GET", path, token = token, headers = mapOf(CAPS_HEADER to CAPS))
         val returnedRegion = (env["region"] as? JsonPrimitive)?.contentOrNull
         if (regionId != null && !regionConfirmed(regionId, returnedRegion)) {
             throw ApiException(502, ApiException.REGION_MISMATCH)
@@ -218,6 +234,7 @@ object ApiClient {
             configJson = adaptForAndroid(cfg).toString(),
             regionId = effectiveId,
             regionName = name ?: effectiveId.replaceFirstChar { it.uppercase() },
+            ipv4Blocked = parseIpv4Blocked(env),
         )
     }
 
@@ -233,6 +250,69 @@ object ApiClient {
         val resp = request("POST", "/owner/invites/update", update.toJson(), token)
         val ok = (resp["ok"] as? JsonPrimitive)?.takeIf { !it.isString }?.booleanOrNull ?: false
         if (!ok) throw ApiException(500, (resp["error"] as? JsonPrimitive)?.contentOrNull ?: "Malformed response")
+    }
+
+    /**
+     * Owner 专用：最近 30 天删除的人（GET /owner/invites/deleted，最近删除的在前）。
+     * 旧后端没有这个接口时抛 ApiException(404)——调用方据此隐藏 Recently Deleted 入口。
+     */
+    suspend fun fetchDeletedInvites(token: String): DeletedInvitesResponse {
+        val resp = parseDeletedInvites(request("GET", "/owner/invites/deleted", token = token))
+        if (resp.ok.not()) throw ApiException(500, resp.error ?: "Malformed response")
+        return resp
+    }
+
+    /**
+     * Owner 专用：恢复一个删除了的人（POST /owner/invites/restore {code}）。
+     * 400 缺 code / 403 owner 的码 / 404 不在了 / 409 已有同名的有效邀请码 —— 都以 ApiException(code) 抛出。
+     * 恢复后邀请码重新可用，旧设备仍是登出状态。
+     */
+    suspend fun restoreInvite(token: String, code: String) {
+        val resp = request("POST", "/owner/invites/restore", buildJsonObject { put("code", code) }, token)
+        val ok = (resp["ok"] as? JsonPrimitive)?.takeIf { it.isString.not() }?.booleanOrNull ?: false
+        if (ok.not()) throw ApiException(500, (resp["error"] as? JsonPrimitive)?.contentOrNull ?: "Malformed response")
+    }
+
+    /** Owner 专用：删除一个人（后端永远是软删除，可在 Recently Deleted 恢复；响应里的 deleted 恒为 false，不看它）。 */
+    suspend fun deleteInvite(token: String, code: String) {
+        val resp = request("POST", "/owner/invites/delete", buildJsonObject { put("code", code) }, token)
+        val ok = (resp["ok"] as? JsonPrimitive)?.takeIf { it.isString.not() }?.booleanOrNull ?: false
+        if (ok.not()) throw ApiException(500, (resp["error"] as? JsonPrimitive)?.contentOrNull ?: "Malformed response")
+    }
+
+    /** Owner 专用：给一台设备改名（POST /owner/devices/rename）。 */
+    suspend fun renameDevice(token: String, profileId: String, displayName: String) {
+        val body = buildJsonObject {
+            put("profileId", profileId)
+            put("displayName", displayName)
+        }
+        val resp = request("POST", "/owner/devices/rename", body, token)
+        val ok = (resp["ok"] as? JsonPrimitive)?.takeIf { it.isString.not() }?.booleanOrNull ?: false
+        if (ok.not()) throw ApiException(500, (resp["error"] as? JsonPrimitive)?.contentOrNull ?: "Malformed response")
+    }
+
+    /** 本设备本周期的用量（GET /device/quota，与 iOS 主页 Bandwidth 同一个接口）。读不出用量 → null。 */
+    suspend fun fetchDeviceQuota(token: String): DeviceQuota? =
+        parseDeviceQuota(request("GET", "/device/quota?fresh=1", token = token))
+
+    /**
+     * 主页的 "Ping ms"：GET /health 两次（第一次含建连），取快的那次的毫秒数；都失败 → null。
+     * 本 app 自己的流量不进隧道（openTun 里 addDisallowedApplication），所以这是本机到 API 的往返时间。
+     */
+    suspend fun ping(): Int? = withContext(Dispatchers.IO) {
+        fun once(): Int? = try {
+            val started = System.nanoTime()
+            pingHttp.newCall(Request.Builder().url("$base/health").header("Cache-Control", "no-cache").build()).execute().use { r ->
+                if (r.code in 200..399) ((System.nanoTime() - started) / 1_000_000).toInt() else null
+            }
+        } catch (_: IOException) {
+            null
+        }
+        listOfNotNull(once(), once()).minOrNull()
+    }
+
+    private val pingHttp by lazy {
+        http.newBuilder().callTimeout(3, TimeUnit.SECONDS).retryOnConnectionFailure(false).build()
     }
 
     /** Owner 专用：所有设备 + 当前周期用量。非 owner 的 token 会得到 403。逐台设备宽松解码。 */
@@ -270,7 +350,7 @@ object ApiClient {
      *    留着它会让引擎按一个不存在的接口名去找。
      * 只在客户端做这层适配，后端一行不改（iOS 继续用原样配置）。
      */
-    private fun adaptForAndroid(config: JsonObject): JsonObject {
+    internal fun adaptForAndroid(config: JsonObject): JsonObject { // internal：JVM 测试验证 outbounds（含双栈 urltest）原样透传
         val inbounds = config["inbounds"] as? JsonArray ?: return config
         val patched = inbounds.map { entry ->
             val ib = entry as? JsonObject ?: return@map entry

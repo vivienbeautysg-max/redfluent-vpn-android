@@ -9,4 +9,5 @@
     <color name="danger">#D92626</color>
     <color name="bg_dark">#000000</color>
     <color name="bg_light">#FFFFFF</color>
+    <color name="paper">#F6F3EE</color>
 </resources>

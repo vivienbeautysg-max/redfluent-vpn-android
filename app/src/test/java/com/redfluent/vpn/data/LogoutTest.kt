@@ -155,6 +155,7 @@ class LogoutTest {
 
     @Test
     fun noticeWording() {
-        assertEquals("Signed out. Enter your invite code to reconnect.", SIGNED_OUT_NOTICE)
+        // 1.3 起与 iOS 一样：激活页上一行 "Signed out"（带图标），下面就是邀请码输入框
+        assertEquals("Signed out", SIGNED_OUT_NOTICE)
     }
 }

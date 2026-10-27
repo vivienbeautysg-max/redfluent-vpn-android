@@ -45,6 +45,10 @@ data class OwnerDevice(
     val usage: DeviceUsage? = null,
     /** 1.2.1：这台设备最后一次真正产生流量的时间（ISO）；null = 从没用过 / 旧后端没有这个字段。 */
     val lastUsedAt: String? = null,
+    /** 1.3：这台设备拨的东京 IPv6 入口；null = 只有 IPv4（新加坡的人没有）。 */
+    val ipv6Entry: String? = null,
+    /** 1.3：上面那个入口是它专属的（不是共用的）。 */
+    val ipv6EntryDedicated: Boolean? = null,
 ) {
     override fun toString(): String = "OwnerDevice(${title()})"
 }
@@ -66,12 +70,16 @@ data class OwnerDevicesResponse(
 
 private val lenientJson = Json { ignoreUnknownKeys = true }
 
-/** 逐级放宽时依次丢掉的字段组合：先丢最不重要的 lastUsedAt，再丢 usage，最后连 inviteCode 一起丢。 */
+/** 1.3 的 IPv6 入口字段：格式不对时最先丢掉（设备照样列出，只显示 "IPv4 only"）。 */
+private val IPV6_FIELDS = setOf("ipv6Entry", "ipv6EntryDedicated")
+
+/** 逐级放宽时依次丢掉的字段组合：先丢 IPv6 入口，再丢 lastUsedAt，再丢 usage，最后连 inviteCode 一起丢。 */
 private val DEVICE_FALLBACKS: List<Set<String>> = listOf(
-    setOf("lastUsedAt"),
-    setOf("usage"),
-    setOf("lastUsedAt", "usage"),
-    setOf("lastUsedAt", "usage", "inviteCode"),
+    IPV6_FIELDS,
+    IPV6_FIELDS + "lastUsedAt",
+    IPV6_FIELDS + "usage",
+    IPV6_FIELDS + setOf("lastUsedAt", "usage"),
+    IPV6_FIELDS + setOf("lastUsedAt", "usage", "inviteCode"),
 )
 
 /**

@@ -76,8 +76,18 @@ class RedFluentVpnService :
         private fun setState(next: TunnelState) {
             val prev = _state.value
             _state.value = next
+            // 1.3：主页"已连接多久"的只读值。只在进入 CONNECTED 时记一次（热重载不经过别的状态，不会重置）。
+            if (next == TunnelState.CONNECTED && prev != TunnelState.CONNECTED) {
+                _connectedSince.value = android.os.SystemClock.elapsedRealtime()
+            } else if (next != TunnelState.CONNECTED) {
+                _connectedSince.value = null
+            }
             if (prev != next) Log.i(TAG, "state $prev -> $next")
         }
+
+        /** 1.3：进入 CONNECTED 的时刻（elapsedRealtime 毫秒）；没连着为 null。界面只读。 */
+        private val _connectedSince = MutableStateFlow<Long?>(null)
+        val connectedSince = _connectedSince.asStateFlow()
 
         private val _lastError = MutableStateFlow<String?>(null)
         val lastError = _lastError.asStateFlow()
@@ -447,6 +457,16 @@ class RedFluentVpnService :
             FollowOutcome.Failed(e.code, e.reason, e.expiresAt)
         } catch (e: Exception) {
             FollowOutcome.Failed(-1, "error")
+        }
+        // 1.3：记下最新的 runtimeMeta.ipv4Blocked（只给主页 IPv6 提示用；存不下不影响隧道）
+        runtime?.let { r ->
+            try {
+                store.setIpv4Blocked(r.ipv4Blocked)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "save runtime meta failed: ${e.javaClass.simpleName}")
+            }
         }
 
         if (!isCurrentRunning(gen)) return // 取配置期间隧道已经停了 / 换了

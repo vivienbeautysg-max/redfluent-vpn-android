@@ -13,6 +13,25 @@ import com.redfluent.vpn.api.LogoutAllResult
 import com.redfluent.vpn.api.OwnerLogoutApi
 import com.redfluent.vpn.api.RuntimeConfig
 import com.redfluent.vpn.api.logOutAll
+import com.redfluent.vpn.data.ActionFeedback
+import com.redfluent.vpn.data.Appearance
+import com.redfluent.vpn.data.FeedbackMachine
+import com.redfluent.vpn.data.FeedbackText
+import com.redfluent.vpn.data.OwnerAction
+import com.redfluent.vpn.data.DEFAULT_REGIONS
+import com.redfluent.vpn.data.DeletedInvite
+import com.redfluent.vpn.data.DeviceQuota
+import com.redfluent.vpn.data.IPv6Hint
+import com.redfluent.vpn.data.LiveStats
+import com.redfluent.vpn.data.OwnerDevice
+import com.redfluent.vpn.data.Person
+import com.redfluent.vpn.data.RecentlyDeleted
+import com.redfluent.vpn.data.buildPeople
+import com.redfluent.vpn.data.ownerCodes
+import com.redfluent.vpn.data.resolveRegion
+import com.redfluent.vpn.net.WifiIpv6Watcher
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import com.redfluent.vpn.data.AccessNotice
 import com.redfluent.vpn.data.DeviceProfile
 import com.redfluent.vpn.data.FollowAction
@@ -28,9 +47,6 @@ import com.redfluent.vpn.data.UsageGroup
 import com.redfluent.vpn.data.UsagePeriod
 import com.redfluent.vpn.data.accessNotice as computeAccessNotice
 import com.redfluent.vpn.data.decideFollow
-import com.redfluent.vpn.data.findLoggableDevice
-import com.redfluent.vpn.data.findLoggableGroup
-import com.redfluent.vpn.data.groupByUser
 import com.redfluent.vpn.data.inviteErrorText
 import com.redfluent.vpn.data.isSignedOutByProfile
 import com.redfluent.vpn.data.locksConnect
@@ -38,7 +54,6 @@ import com.redfluent.vpn.data.logoutErrorText
 import com.redfluent.vpn.data.normalizeRegionId
 import com.redfluent.vpn.data.runtimeRegionParam
 import com.redfluent.vpn.data.shouldDisconnectForRegions
-import com.redfluent.vpn.data.sortInvites
 import com.redfluent.vpn.debug.DebugHooks
 import com.redfluent.vpn.vpn.RedFluentVpnService
 import kotlinx.coroutines.CancellationException
@@ -64,38 +79,41 @@ import kotlinx.coroutines.withTimeoutOrNull
 
 private const val TAG = "RfvViewModel"
 
-/** Usage 页的界面状态。刷新失败时保留上一份数据，同时标出「这份数据可能过期」。 */
-sealed interface UsageUiState {
-    data object Loading : UsageUiState
-    data class Error(val message: String) : UsageUiState
-    data class Loaded(
-        val period: UsagePeriod?,
-        val groups: List<UsageGroup>,
-        val refreshFailed: Boolean = false,
-    ) : UsageUiState
+/** Owner Admin（People）要用的全部数据。 */
+data class AdminData(
+    val invites: List<OwnerInvite> = emptyList(),
+    val devices: List<OwnerDevice> = emptyList(),
+    val period: UsagePeriod? = null,
+    val deleted: List<DeletedInvite> = emptyList(),
+    /** 后端有 Recently Deleted（GET /owner/invites/deleted 不是 404）。 */
+    val deletedSupported: Boolean = false,
+    val deletedError: String? = null,
+) {
+    /** 一个邀请码一个人（owner 自己的那个认得出来）。 */
+    fun people(ownProfileId: String?, storedCode: String?, ownerLabel: String?): List<Person> =
+        buildPeople(invites, devices, ownerCodes(devices, ownProfileId, storedCode), ownerLabel)
 }
 
-/** Usage 页里「Log out / Log out all devices」的进度。失败原因留在页面上，直到下一次操作或刷新成功。 */
-sealed interface UsageAction {
-    data object Idle : UsageAction
-    data object Working : UsageAction
-    data class Error(val message: String) : UsageAction
+/** Owner Admin 的界面状态。刷新失败时保留上一份数据，同时标出「这份数据可能过期」。 */
+sealed interface AdminUiState {
+    data object Loading : AdminUiState
+    data class Error(val message: String) : AdminUiState
+    data class Loaded(val data: AdminData, val refreshFailed: Boolean = false) : AdminUiState
 }
 
-/** Users 页（owner 管理邀请码）的界面状态。 */
-sealed interface UsersUiState {
-    data object Loading : UsersUiState
-    data class Error(val message: String) : UsersUiState
-    data class Loaded(val invites: List<OwnerInvite>, val refreshFailed: Boolean = false) : UsersUiState
+/** Owner Admin 里现在在哪一页。 */
+sealed interface AdminRoute {
+    data object People : AdminRoute
+    data class Person(val code: String) : AdminRoute
+    data object Deleted : AdminRoute
 }
 
-/** 编辑面板里「保存」的进度。 */
-sealed interface InviteSaveState {
-    data object Idle : InviteSaveState
-    data object Saving : InviteSaveState
-    data object Done : InviteSaveState
-    data class Error(val message: String) : InviteSaveState
-}
+/** Recently Deleted 页：正在恢复的、恢复失败的原因、刚恢复的人名。 */
+data class RestoreUi(
+    val working: Set<String> = emptySet(),
+    val errors: Map<String, String> = emptyMap(),
+    val restored: List<String> = emptyList(),
+)
 
 /** 界面的唯一状态源。所有显示都基于真实状态，不做乐观更新。 */
 class AppViewModel(app: Application) : AndroidViewModel(app) {
@@ -129,6 +147,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     val inviteCode: StateFlow<String?> =
         store.lastInviteFlow.stateIn(viewModelScope, SharingStarted.Eagerly, null)
+
+    /** 本地资料和引导标记都读到了：之前界面只画一块底色，不会先闪一下引导页 / 激活页。 */
+    val loaded: StateFlow<Boolean> =
+        combine(store.profileFlow, store.onboardedFlow) { _, _ -> true }
+            .stateIn(viewModelScope, SharingStarted.Eagerly, false)
 
     /** 用户选的区域（owner 才有得选；其他人永远是东京）。 */
     val selectedRegion: StateFlow<String> =
@@ -168,31 +191,76 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val _needsVpnPermission = MutableStateFlow(false)
     val needsVpnPermission = _needsVpnPermission.asStateFlow()
 
-    private val _showUsage = MutableStateFlow(false)
-    val showUsage = _showUsage.asStateFlow()
+    private val _showAdmin = MutableStateFlow(false)
+    val showAdmin = _showAdmin.asStateFlow()
 
-    private val _usage = MutableStateFlow<UsageUiState>(UsageUiState.Loading)
-    val usage = _usage.asStateFlow()
+    private val _adminRoute = MutableStateFlow<AdminRoute>(AdminRoute.People)
+    val adminRoute = _adminRoute.asStateFlow()
 
-    private val _showUsers = MutableStateFlow(false)
-    val showUsers = _showUsers.asStateFlow()
+    private val _admin = MutableStateFlow<AdminUiState>(AdminUiState.Loading)
+    val admin = _admin.asStateFlow()
 
-    private val _users = MutableStateFlow<UsersUiState>(UsersUiState.Loading)
-    val users = _users.asStateFlow()
+    /** 所有要等服务器的操作共用的反馈：哪个在忙 + 顶部横幅（见 [FeedbackMachine]）。 */
+    private val _feedback = MutableStateFlow(ActionFeedback())
+    val feedback = _feedback.asStateFlow()
 
-    private val _saveState = MutableStateFlow<InviteSaveState>(InviteSaveState.Idle)
-    val saveState = _saveState.asStateFlow()
+    /** 开始一个操作；已有操作在进行时返回 false（不发第二次请求）。 */
+    private fun startAction(action: OwnerAction): Boolean {
+        val next = FeedbackMachine.start(_feedback.value, action) ?: return false
+        _feedback.value = next
+        return true
+    }
 
-    /** Users 列表是否展开：默认收起，本次使用期间记住（退出登录时复位）。 */
-    private val _usersExpanded = MutableStateFlow(false)
-    val usersExpanded = _usersExpanded.asStateFlow()
+    private fun succeed(text: String) {
+        _feedback.value = FeedbackMachine.succeed(_feedback.value, text)
+    }
 
-    /** Usage 页里展开了设备列表的用户（按 UsageGroup.key），刷新不会收起。 */
-    private val _expandedUsage = MutableStateFlow<Set<String>>(emptySet())
-    val expandedUsage = _expandedUsage.asStateFlow()
+    private fun fail(text: String) {
+        _feedback.value = FeedbackMachine.fail(_feedback.value, text)
+    }
 
-    private val _usageAction = MutableStateFlow<UsageAction>(UsageAction.Idle)
-    val usageAction = _usageAction.asStateFlow()
+    fun dismissBanner(seq: Long) {
+        _feedback.value = FeedbackMachine.dismiss(_feedback.value, seq)
+    }
+
+    private val _restore = MutableStateFlow(RestoreUi())
+    val restore = _restore.asStateFlow()
+
+    // ---- 1.3 主页 ----
+
+    /** app 内选的明暗。初值由 MainActivity 在第一帧前读好传进来，避免先白后黑闪一下。 */
+    val appearance: StateFlow<Appearance> =
+        store.appearanceFlow.stateIn(viewModelScope, SharingStarted.Eagerly, Appearance.LIGHT)
+
+    /** 本设备本周期用量（Bandwidth）；拿不到时为 null，主页显示 "—"。 */
+    private val _quota = MutableStateFlow<DeviceQuota?>(null)
+    val quota = _quota.asStateFlow()
+
+    /** Down / Up MB/s 与 Ping（只在前台且已连接时测）。 */
+    private val _stats = MutableStateFlow(LiveStats())
+    val stats = _stats.asStateFlow()
+
+    /** 进入 CONNECTED 的时刻（elapsedRealtime）；没连着为 null。 */
+    val connectedSince: StateFlow<Long?> = RedFluentVpnService.connectedSince
+
+    private val wifi = WifiIpv6Watcher(app)
+    private val foreground = MutableStateFlow(false)
+
+    /** 正在用（或要用）的区域：连着时以隧道确认的区域为准，否则按选择 / 服务器分配。 */
+    val regionInUse: StateFlow<String> =
+        combine(profile, selectedRegion, RedFluentVpnService.activeRegionId, serviceState) { p, sel, active, st ->
+            if (st == TunnelState.CONNECTED && !active.isNullOrBlank()) {
+                normalizeRegionId(active)
+            } else {
+                resolveRegion(sel, p?.regions ?: DEFAULT_REGIONS)
+            }
+        }.stateIn(viewModelScope, SharingStarted.Eagerly, REGION_TOKYO)
+
+    /** "Wi-Fi has no IPv6 — switch to cellular"（规则同 iOS IPv6Hint，另按上一次运行配置的 runtimeMeta.ipv4Blocked 开关）。 */
+    val ipv6Hint: StateFlow<Boolean> =
+        combine(wifi.state, regionInUse, store.ipv4BlockedFlow) { w, region, blocked ->
+            IPv6Hint.shows(w.onWiFi, w.wifiHasIPv6, region, blocked)
+        }.stateIn(viewModelScope, SharingStarted.Eagerly, false)
 
     /** 这台设备被 owner 登出后，激活页上显示 "Signed out. …"（不是吓人的错误）。 */
     private val _signedOut = MutableStateFlow(false)
@@ -208,10 +276,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private var lastProfileRefreshAt = 0L
     private var refreshJob: Job? = null
-    private var usageJob: Job? = null
-    private var usersJob: Job? = null
-    private var saveJob: Job? = null
+    private var adminJob: Job? = null
     private var actionJob: Job? = null
+    private var quotaJob: Job? = null
 
     // 「连接 / 断开 / 切区域 / 退出登录」同一时刻只能有一个在进行：
     // 新的操作先取消旧的（包括取配置到一半的连接——它迟到的结果会被丢弃），再开始自己。
@@ -257,6 +324,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    init {
+        startStatsLoop()
+    }
+
     fun finishOnboarding() {
         launchSafe { safely("save onboarding flag") { store.setOnboarded() } }
     }
@@ -264,6 +335,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun activate(code: String) {
         val trimmed = code.trim()
         if (trimmed.isEmpty() || _activating.value) return
+        if (startAction(OwnerAction.ACTIVATE).not()) return
         launchSafe {
             _activating.value = true
             _activationError.value = null
@@ -280,10 +352,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 store.saveInviteCode(trimmed)
                 // 激活响应里不一定带 owner / 区域信息，立刻再取一次 /profile。
                 refreshProfile(force = true)
+                refreshQuota()
+                succeed(FeedbackText.ACTIVATED)
             } catch (e: CancellationException) {
+                _feedback.value = _feedback.value.copy(busy = null)
                 throw e
             } catch (e: Exception) {
-                _activationError.value = e.message ?: "Activation failed"
+                val message = e.message ?: "Activation failed"
+                _activationError.value = message
+                fail(message)
             } finally {
                 _activating.value = false
             }
@@ -297,18 +374,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun signOut(signedOut: Boolean = false) {
         _signedOut.value = signedOut
         refreshJob?.cancel()
-        usageJob?.cancel()
-        usersJob?.cancel()
-        saveJob?.cancel()
+        adminJob?.cancel()
         actionJob?.cancel()
-        _showUsage.value = false
-        _usage.value = UsageUiState.Loading
-        _showUsers.value = false
-        _users.value = UsersUiState.Loading
-        _saveState.value = InviteSaveState.Idle
-        _usersExpanded.value = false
-        _expandedUsage.value = emptySet()
-        _usageAction.value = UsageAction.Idle
+        quotaJob?.cancel()
+        _showAdmin.value = false
+        _adminRoute.value = AdminRoute.People
+        _admin.value = AdminUiState.Loading
+        _feedback.value = _feedback.value.copy(busy = null, banner = null)
+        _restore.value = RestoreUi()
+        _quota.value = null
         RedFluentVpnService.clearFailure()
         RedFluentVpnService.clearStopReason()
         beginOp {
@@ -374,10 +448,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
         if (applied == null) return
 
-        // 不再是 owner：收起 Usage / Users 页
+        // 不再是 owner：收起 Owner Admin
         if (!applied.profile.isOwner) {
-            _showUsage.value = false
-            _showUsers.value = false
+            _showAdmin.value = false
         }
 
         // 资料已刷新：以资料为准，清掉服务给的"刚被叫停"提示（到期以资料为准；吊销要等设备恢复启用才解除）
@@ -537,6 +610,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             return false
         }
 
+        // 记下这份配置的 runtimeMeta.ipv4Blocked（主页 IPv6 提示据此开关）
+        safely("save runtime meta") { store.setIpv4Blocked(runtime.ipv4Blocked) }
+
         // 取配置期间可能已被取代（切了区域 / 点了断开 / 退出登录）或设备已换账号：丢弃这份配置
         currentCoroutineContext().ensureActive()
         val latest = store.profile()
@@ -571,68 +647,220 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         )
     }
 
-    // ---- Owner：用量 ----------------------------------------------------
+    // ---- 1.3 主页：明暗 / 用量 / 实时读数 / Wi-Fi ----------------------------------------------
 
-    fun openUsage() {
-        if (profile.value?.isOwner != true) return
-        _showUsage.value = true
-        refreshUsage()
+    fun setAppearance(value: Appearance) {
+        launchSafe { safely("save appearance") { store.setAppearance(value) } }
     }
 
-    fun closeUsage() {
-        _showUsage.value = false
+    /** 前台 / 后台：只在前台时盯 Wi-Fi、测速度和延迟（同 iOS：scenePhase 不在前台就全停）。 */
+    fun setForeground(value: Boolean) {
+        foreground.value = value
+        if (value) {
+            wifi.start()
+            refreshQuota()
+        } else {
+            wifi.stop()
+        }
     }
 
-    fun refreshUsage() {
-        if (usageJob?.isActive == true) return
-        usageJob = launchSafe {
-            val p = store.profile()
-            if (p == null || !p.isOwner) return@launchSafe
+    /** Bandwidth：GET /device/quota。失败保留上一次的读数（没有就是 "—"），不打扰用户。 */
+    fun refreshQuota() {
+        if (quotaJob?.isActive == true) return
+        quotaJob = launchSafe {
+            val p = store.profile() ?: return@launchSafe
             try {
-                val resp = ApiClient.fetchOwnerDevices(p.token)
-                if (resp.skipped > 0) Log.w(TAG, "usage: ${resp.skipped} device(s) could not be decoded")
-                // 请求在途时设备可能已换账号：不把上一个账号的用量显示给新账号
+                val q = ApiClient.fetchDeviceQuota(p.token)
                 if (store.profile()?.profileId != p.profileId) return@launchSafe
-                _usage.value = UsageUiState.Loaded(resp.period, groupByUser(resp.devices, inviteCode.value, p.ownerLabel))
+                if (q != null) _quota.value = q
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                val current = _usage.value
-                _usage.value = if (current is UsageUiState.Loaded) {
+                Log.w(TAG, "quota refresh failed: ${e.javaClass.simpleName}")
+            }
+        }
+    }
+
+    /**
+     * 已连接且在前台时：每秒用本 app 的收发字节数算 Down / Up（引擎的出站连接都属于本 app，
+     * 所以这就是隧道流量；只读系统计数，不碰引擎），每 15 秒测一次 Ping。断开 / 退到后台即停，读数清空。
+     */
+    private fun startStatsLoop() {
+        launchSafe {
+            combine(foreground, serviceState) { fg, st -> fg && st == TunnelState.CONNECTED }
+                .distinctUntilChanged()
+                .collectLatest { live ->
+                    _stats.value = LiveStats()
+                    if (live.not()) return@collectLatest
+                    val uid = android.os.Process.myUid()
+                    var lastRx = android.net.TrafficStats.getUidRxBytes(uid)
+                    var lastTx = android.net.TrafficStats.getUidTxBytes(uid)
+                    var lastAt = SystemClock.elapsedRealtime()
+                    var tick = 0
+                    while (true) {
+                        if (tick % PING_EVERY_TICKS == 0) {
+                            launchSafe {
+                                val ms = ApiClient.ping()
+                                if (serviceState.value == TunnelState.CONNECTED) _stats.value = _stats.value.copy(pingMs = ms)
+                            }
+                        }
+                        delay(STATS_TICK_MS)
+                        tick++
+                        val rx = android.net.TrafficStats.getUidRxBytes(uid)
+                        val tx = android.net.TrafficStats.getUidTxBytes(uid)
+                        val now = SystemClock.elapsedRealtime()
+                        val dt = (now - lastAt).coerceAtLeast(1L)
+                        val supported = rx >= 0 && tx >= 0 && lastRx >= 0 && lastTx >= 0
+                        _stats.value = _stats.value.copy(
+                            downBps = if (supported) ((rx - lastRx).coerceAtLeast(0) * 1000 / dt) else null,
+                            upBps = if (supported) ((tx - lastTx).coerceAtLeast(0) * 1000 / dt) else null,
+                        )
+                        lastRx = rx
+                        lastTx = tx
+                        lastAt = now
+                    }
+                }
+        }
+    }
+
+    // ---- Owner Admin（People）----------------------------------------------------------------
+
+    fun openAdmin() {
+        if (profile.value?.isOwner != true) return
+        _adminRoute.value = AdminRoute.People
+        _showAdmin.value = true
+        refreshAdmin()
+    }
+
+    fun closeAdmin() {
+        _showAdmin.value = false
+    }
+
+    /** 系统返回键：个人页 / Recently Deleted → People；People → 主页。 */
+    fun adminBack() {
+        if (_adminRoute.value == AdminRoute.People) {
+            closeAdmin()
+        } else {
+            _adminRoute.value = AdminRoute.People
+            _restore.value = RestoreUi()
+        }
+    }
+
+    fun openPerson(code: String) {
+        _adminRoute.value = AdminRoute.Person(code)
+    }
+
+    fun openDeleted() {
+        _restore.value = RestoreUi()
+        _adminRoute.value = AdminRoute.Deleted
+        refreshAdmin()
+    }
+
+    fun refreshAdmin() {
+        if (adminJob?.isActive == true) return
+        adminJob = launchSafe {
+            val p = store.profile()
+            if (p == null || p.isOwner.not()) return@launchSafe
+            val previous = (_admin.value as? AdminUiState.Loaded)?.data
+            try {
+                val (invites, devices) = coroutineScope {
+                    val inv = async { ApiClient.fetchOwnerInvites(p.token) }
+                    val dev = async { ApiClient.fetchOwnerDevices(p.token) }
+                    inv.await() to dev.await()
+                }
+                if (invites.skipped > 0) Log.w(TAG, "people: ${invites.skipped} invite(s) could not be decoded")
+                if (devices.skipped > 0) Log.w(TAG, "people: ${devices.skipped} device(s) could not be decoded")
+                val deleted = loadDeleted(p.token, previous)
+                // 请求在途时设备可能已换账号：不把上一个账号的数据显示给新账号
+                if (store.profile()?.profileId != p.profileId) return@launchSafe
+                _admin.value = AdminUiState.Loaded(
+                    AdminData(
+                        invites = invites.invites,
+                        devices = devices.devices,
+                        period = devices.period,
+                        deleted = deleted.deleted,
+                        deletedSupported = deleted.deletedSupported,
+                        deletedError = deleted.deletedError,
+                    ),
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                val current = _admin.value
+                _admin.value = if (current is AdminUiState.Loaded) {
                     current.copy(refreshFailed = true)
                 } else {
-                    UsageUiState.Error(e.message ?: "Failed to load usage")
+                    AdminUiState.Error(e.message ?: "Failed to load people")
                 }
             }
         }
     }
 
-    /** 展开 / 收起一个用户的设备列表（本次使用期间记住）。 */
-    fun toggleUsageUser(key: String) {
-        _expandedUsage.value = _expandedUsage.value.let { if (key in it) it - key else it + key }
+    /** 404 = 旧后端：入口隐藏、不报错；其它失败保留入口，在 Recently Deleted 页上说原因。 */
+    private suspend fun loadDeleted(token: String, previous: AdminData?): AdminData = try {
+        val r = ApiClient.fetchDeletedInvites(token)
+        AdminData(deleted = RecentlyDeleted.sorted(r.invites), deletedSupported = true)
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: ApiException) {
+        if (RecentlyDeleted.isUnsupported(e.code)) {
+            AdminData(deletedSupported = false)
+        } else {
+            AdminData(deleted = previous?.deleted.orEmpty(), deletedSupported = true, deletedError = e.message)
+        }
+    } catch (e: Exception) {
+        AdminData(deleted = previous?.deleted.orEmpty(), deletedSupported = true, deletedError = e.message ?: "Failed to load")
     }
 
-    fun dismissUsageActionError() {
-        if (_usageAction.value is UsageAction.Error) _usageAction.value = UsageAction.Idle
+    private fun currentData(): AdminData? = (_admin.value as? AdminUiState.Loaded)?.data
+
+    private fun currentPerson(code: String): Person? {
+        val data = currentData() ?: return null
+        val p = profile.value
+        return data.people(p?.profileId, inviteCode.value, p?.ownerLabel).firstOrNull { it.code == code }
     }
 
-    /** 把一台设备登出：设备回到激活页，邀请码仍然有效。owner 自己的设备永远不会走到这里。 */
-    fun logoutDevice(profileId: String) {
-        if (actionJob?.isActive == true) return
-        val groups = (_usage.value as? UsageUiState.Loaded)?.groups ?: return
-        if (findLoggableDevice(groups, profileId) == null) return
-        runOwnerAction { token ->
-            ApiClient.revokeDevice(token, profileId)
+
+    /** 保存个人页：六个字段完整带上（见 [buildInviteUpdate]）。成功后跟着新邀请码，刷新列表。 */
+    fun savePerson(update: InviteUpdate) {
+        runAdminOp(
+            OwnerAction.SAVE,
+            successText = { FeedbackText.SAVED },
+            errorText = { code, reason -> inviteErrorText(code, reason) },
+            onDone = { if (_adminRoute.value == AdminRoute.Person(update.code)) _adminRoute.value = AdminRoute.Person(update.newCode) },
+        ) { token ->
+            ApiClient.updateInvite(token, update)
             null
         }
     }
 
-    /** 把一个用户的所有可用设备登出（接口还没上线时逐台回退）。owner 自己的邀请码永远不会走到这里。 */
-    fun logoutAll(groupKey: String) {
-        if (actionJob?.isActive == true) return
-        val groups = (_usage.value as? UsageUiState.Loaded)?.groups ?: return
-        val group = findLoggableGroup(groups, groupKey) ?: return
-        runOwnerAction { token ->
+    /** 删除一个人（软删除，30 天内可在 Recently Deleted 恢复）。owner 自己的永远走不到这里。 */
+    fun deletePerson(code: String) {
+        val person = currentPerson(code) ?: return
+        if (person.isOwner) return
+        runAdminOp(
+            OwnerAction.DELETE,
+            successText = { FeedbackText.deleted(person.label) },
+            onDone = { if (_adminRoute.value == AdminRoute.Person(code)) _adminRoute.value = AdminRoute.People },
+        ) { token ->
+            ApiClient.deleteInvite(token, person.code)
+            null
+        }
+    }
+
+    /** 把一个人的所有可用设备登出（接口还没上线时逐台回退，规则见 [logOutAll]）。 */
+    fun logoutAll(code: String) {
+        val person = currentPerson(code) ?: return
+        if (person.isOwner || person.devicesInUse == 0) return
+        val group = UsageGroup(
+            label = person.label,
+            totalGB = person.usedGB ?: 0.0,
+            devices = person.devices.map { it.device },
+            code = person.code,
+            activeDevices = person.devicesInUse,
+            isOwnerInvite = false,
+        )
+        runAdminOp(OwnerAction.LOG_OUT_ALL, successText = { FeedbackText.loggedOutAll(person.devicesInUse) }) { token ->
             val api = object : OwnerLogoutApi {
                 override suspend fun logoutUser(code: String): Int? = ApiClient.logoutUser(token, code)
                 override suspend fun revokeDevice(profileId: String) = ApiClient.revokeDevice(token, profileId)
@@ -641,101 +869,100 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** 跑一个 owner 操作：成功（返回 null）或失败（返回原因）之后都刷新用量，让界面显示真实状态。 */
-    private fun runOwnerAction(action: suspend (token: String) -> String?) {
+    /** 把一台设备登出：设备回到激活页，邀请码仍然有效。owner 自己的设备永远不会走到这里。 */
+    fun logoutDevice(code: String, profileId: String) {
+        val person = currentPerson(code) ?: return
+        if (person.isOwner) return
+        val row = person.devices.firstOrNull { it.device.profileId == profileId && it.signedIn } ?: return
+        val name = row.device.displayName?.trim()?.takeIf { it.isNotEmpty() } ?: row.device.deviceName ?: "Device"
+        runAdminOp(OwnerAction.LOG_OUT_DEVICE, successText = { FeedbackText.loggedOutDevice(name) }) { token ->
+            ApiClient.revokeDevice(token, profileId)
+            null
+        }
+    }
+
+    fun renameDevice(profileId: String, name: String) {
+        val trimmed = name.trim()
+        if (trimmed.isEmpty() || trimmed.length > 80) return
+        runAdminOp(OwnerAction.RENAME, successText = { FeedbackText.RENAMED }) { token ->
+            ApiClient.renameDevice(token, profileId, trimmed)
+            null
+        }
+    }
+
+    /**
+     * 跑一个 owner 操作：成功（返回 null）或失败（返回原因 / 抛出）都进顶部横幅，之后刷新列表，让界面显示真实状态。
+     * 已有操作在进行时直接忽略（按钮也是禁用的），不会发出第二次请求。
+     */
+    private fun runAdminOp(
+        action: OwnerAction,
+        successText: () -> String,
+        errorText: (Int, String) -> String = ::logoutErrorText,
+        onDone: () -> Unit = {},
+        block: suspend (token: String) -> String?,
+    ) {
+        if (startAction(action).not()) return
         actionJob = launchSafe {
-            _usageAction.value = UsageAction.Working
             try {
                 val p = store.profile()
-                if (p == null || !p.isOwner) {
-                    _usageAction.value = UsageAction.Error("Not allowed.")
+                if (p == null || p.isOwner.not()) {
+                    fail("Not allowed.")
                     return@launchSafe
                 }
-                val failure = action(p.token)
-                _usageAction.value = if (failure == null) UsageAction.Idle else UsageAction.Error(failure)
-                usageJob?.cancel()
-                refreshUsage()
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: ApiException) {
-                _usageAction.value = UsageAction.Error(logoutErrorText(e.code, e.reason))
-                usageJob?.cancel()
-                refreshUsage()
-            } catch (e: Exception) {
-                _usageAction.value = UsageAction.Error(e.message ?: "Could not log out.")
-            }
-        }
-    }
-
-    // ---- Owner：Users（每个邀请码的区域与使用时长）--------------------------------
-
-    fun toggleUsersExpanded() {
-        _usersExpanded.value = !_usersExpanded.value
-    }
-
-    fun openUsers() {
-        if (profile.value?.isOwner != true) return
-        _saveState.value = InviteSaveState.Idle
-        _showUsers.value = true
-        refreshUsers()
-    }
-
-    fun closeUsers() {
-        _showUsers.value = false
-        saveJob?.cancel()
-        _saveState.value = InviteSaveState.Idle
-    }
-
-    fun refreshUsers() {
-        if (usersJob?.isActive == true) return
-        usersJob = launchSafe {
-            val p = store.profile()
-            if (p == null || !p.isOwner) return@launchSafe
-            try {
-                val resp = ApiClient.fetchOwnerInvites(p.token)
-                if (resp.skipped > 0) Log.w(TAG, "users: ${resp.skipped} invite(s) could not be decoded")
-                if (store.profile()?.profileId != p.profileId) return@launchSafe
-                _users.value = UsersUiState.Loaded(sortInvites(resp.invites))
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                val current = _users.value
-                _users.value = if (current is UsersUiState.Loaded) {
-                    current.copy(refreshFailed = true)
+                val failure = block(p.token)
+                if (failure == null) {
+                    onDone()
+                    succeed(successText())
                 } else {
-                    UsersUiState.Error(e.message ?: "Failed to load users")
+                    fail(failure)
                 }
-            }
-        }
-    }
-
-    /** 保存编辑面板：只发改了的字段；失败时原因留在面板里（InviteSaveState.Error），成功后刷新列表。 */
-    fun saveInvite(update: InviteUpdate) {
-        if (saveJob?.isActive == true) return
-        saveJob = launchSafe {
-            _saveState.value = InviteSaveState.Saving
-            try {
-                val p = store.profile()
-                if (p == null || !p.isOwner) {
-                    _saveState.value = InviteSaveState.Error("Not allowed.")
-                    return@launchSafe
-                }
-                ApiClient.updateInvite(p.token, update)
-                _saveState.value = InviteSaveState.Done
-                usersJob?.cancel()
-                refreshUsers()
             } catch (e: CancellationException) {
+                _feedback.value = _feedback.value.copy(busy = null)
                 throw e
             } catch (e: ApiException) {
-                _saveState.value = InviteSaveState.Error(inviteErrorText(e.code, e.reason))
+                fail(errorText(e.code, e.reason))
             } catch (e: Exception) {
-                _saveState.value = InviteSaveState.Error(e.message ?: "Save failed.")
+                fail(e.message ?: "Something went wrong.")
             }
+            adminJob?.cancel()
+            refreshAdmin()
         }
     }
 
-    fun resetSaveState() {
-        _saveState.value = InviteSaveState.Idle
+    /** 恢复一个删除了的人：邀请码重新可用，旧设备仍是登出状态（每台要重新输入邀请码）。 */
+    fun restore(item: DeletedInvite) {
+        if (_restore.value.working.contains(item.key)) return
+        if (startAction(OwnerAction.RESTORE).not()) return
+        _restore.value = _restore.value.let { it.copy(working = it.working + item.key, errors = it.errors - item.key) }
+        launchSafe {
+            var error: String? = null
+            try {
+                val p = store.profile()
+                if (p == null || p.isOwner.not()) {
+                    error = "Not allowed."
+                } else {
+                    ApiClient.restoreInvite(p.token, item.code)
+                }
+            } catch (e: CancellationException) {
+                _feedback.value = _feedback.value.copy(busy = null)
+                throw e
+            } catch (e: ApiException) {
+                error = RecentlyDeleted.restoreFailureText(e.code, e.reason)
+            } catch (e: Exception) {
+                error = e.message ?: "Could not restore."
+            }
+            val failed = error
+            _restore.value = _restore.value.let {
+                if (failed == null) {
+                    it.copy(working = it.working - item.key, restored = it.restored + item.label)
+                } else {
+                    it.copy(working = it.working - item.key, errors = it.errors + (item.key to failed))
+                }
+            }
+            if (failed == null) succeed(FeedbackText.restored(item.label)) else fail(failed)
+            adminJob?.cancel()
+            refreshAdmin()
+        }
     }
 
     private companion object {
@@ -744,5 +971,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         const val STOP_TIMEOUT_MS = 5_000L
         const val RESTART_SETTLE_MS = 500L
         const val START_ACK_TIMEOUT_MS = 3_000L
+        const val STATS_TICK_MS = 1_000L
+        const val PING_EVERY_TICKS = 15
     }
 }

@@ -35,6 +35,21 @@ class InvitesTest {
         activatedAt = activatedAt, effectiveExpiresAt = effective, expiresAt = legacy, daysLeft = daysLeft, expired = expired,
     )
 
+    /**
+     * 1.3：保存走个人页（PersonDraft → edit → buildInviteUpdate）。这里按 1.2 测试的写法只改区域 / 时长，
+     * 其余字段保持服务器当前值——走的是个人页真实的那条路径。
+     */
+    private fun buildInviteUpdate(i: OwnerInvite, region: String, access: AccessChoice, kind: ProtectedKind? = null): InviteUpdate? {
+        val pick = when (access) {
+            AccessChoice.NoLimit -> AccessPick.NoLimit
+            is AccessChoice.Days -> if (access.days in ACCESS_PRESETS) AccessPick.Preset(access.days) else AccessPick.Custom
+        }
+        val custom = (access as? AccessChoice.Days)?.days?.toString().orEmpty()
+        val draft = PersonDraft.from(i).copy(region = region, access = pick, customDaysText = custom)
+        val edit = draft.edit(showsRegion = true, showsAccess = kind != ProtectedKind.REVIEW) ?: return null
+        return buildInviteUpdate(i, edit, kind)
+    }
+
     /** 后端 update 每次都完整读取的六个字段（newCode = code，与 iOS 一致）。 */
     private val BASE_KEYS = setOf("code", "newCode", "label", "maxDevices", "monthlyQuotaGB", "enabled")
 

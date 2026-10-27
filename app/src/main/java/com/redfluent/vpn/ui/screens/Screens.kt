@@ -1,8 +1,11 @@
 package com.redfluent.vpn.ui.screens
 
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -11,159 +14,105 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Lock
-import androidx.compose.material.icons.filled.Send
-import androidx.compose.material.icons.filled.VerifiedUser
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.rotate
-import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import com.redfluent.vpn.ui.theme.Brand
-import com.redfluent.vpn.ui.theme.Radius
-import com.redfluent.vpn.ui.theme.Spacing
+import com.redfluent.vpn.ui.components.DotStyle
+import com.redfluent.vpn.ui.components.DotTitle
+import com.redfluent.vpn.ui.components.Haptic
+import com.redfluent.vpn.ui.components.LandingArt
+import com.redfluent.vpn.ui.components.PrimaryButton
+import com.redfluent.vpn.ui.components.Wordmark
+import com.redfluent.vpn.ui.theme.Gutter
+import com.redfluent.vpn.ui.theme.Rf
+import com.redfluent.vpn.ui.theme.RfType
+import kotlinx.coroutines.launch
 
-/** 品牌渐变背景，与 iOS 版一致：左上 brandPrimary → 右下 brandSecondary。 */
-private val BrandGradient = Brush.linearGradient(listOf(Brand.Primary, Brand.Secondary))
+const val PRIVACY_URL = "https://www.redfluent.com/privacy"
+const val TERMS_URL = "https://www.redfluent.com/terms"
+const val SUPPORT_URL = "https://www.redfluent.com/support"
 
-private data class Slide(val icon: ImageVector, val title: String, val body: String)
+private val TITLES = listOf("Redfluent VPN", "Invite only", "Private")
 
-private val slides = listOf(
-    Slide(
-        Icons.Filled.Send,
-        "RedFluent VPN",
-        "A private secure tunnel built for trusted devices. Not a public service.",
-    ),
-    Slide(
-        Icons.Filled.VerifiedUser,
-        "Invite only",
-        "Each device gets its own revocable profile. No public signup, no advertising.",
-    ),
-    Slide(
-        Icons.Filled.Lock,
-        "Privacy first",
-        "Your traffic is encrypted between this device and RedFluent infrastructure. We do not sell data.",
-    ),
-)
-
+/** 三页安静的引导：红点落到线上，每页一个词，不解释（同 iOS OnboardingView）。 */
 @Composable
 fun OnboardingScreen(onDone: () -> Unit) {
-    var page by remember { mutableIntStateOf(0) }
-    val slide = slides[page]
-
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(BrandGradient),
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(horizontal = Spacing.lg),
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
+    val pager = rememberPagerState { TITLES.size }
+    val scope = rememberCoroutineScope()
+    val last = pager.currentPage == TITLES.lastIndex
+    BoxWithConstraints(Modifier.fillMaxSize().background(Rf.colors.paper)) {
+        val compact = maxHeight < 700.dp
+        Column(Modifier.fillMaxSize().safeDrawingPadding()) {
+            Box(Modifier.padding(horizontal = Gutter).height(50.dp), contentAlignment = Alignment.CenterStart) { Wordmark() }
             Spacer(Modifier.weight(1f))
-
-            Box(
-                modifier = Modifier
-                    .size(180.dp)
-                    .clip(CircleShape)
-                    .background(Color.White.copy(alpha = 0.15f)),
-                contentAlignment = Alignment.Center,
-            ) {
-                Icon(
-                    slide.icon,
-                    contentDescription = null,
-                    tint = Color.White,
-                    modifier = Modifier
-                        .size(72.dp)
-                        .then(if (page == 0) Modifier.rotate(-30f) else Modifier),
-                )
+            LandingArt(landed = last, glowing = last, height = if (compact) 190f else 236f, showsPower = false)
+            Spacer(Modifier.weight(1f))
+            HorizontalPager(state = pager, modifier = Modifier.fillMaxWidth().height(if (compact) 70.dp else 80.dp)) { i ->
+                Box(Modifier.fillMaxSize().padding(horizontal = Gutter), contentAlignment = Alignment.CenterStart) {
+                    DotTitle(TITLES[i], size = if (compact) 44f else 50f, dot = DotStyle.FILLED)
+                }
             }
-
-            Spacer(Modifier.height(Spacing.lg))
-            Text(
-                slide.title,
-                fontSize = 36.sp,
-                fontWeight = FontWeight.Bold,
-                color = Color.White,
-            )
-            Spacer(Modifier.height(Spacing.md))
-            Text(
-                slide.body,
-                fontSize = 17.sp,
-                color = Color.White.copy(alpha = 0.85f),
-                textAlign = TextAlign.Center,
-                modifier = Modifier.padding(horizontal = Spacing.xl),
-            )
-
-            Spacer(Modifier.weight(1f))
-
-            // 页码指示
             Row(
-                horizontalArrangement = Arrangement.spacedBy(Spacing.sm),
-                modifier = Modifier.padding(bottom = Spacing.lg),
+                Modifier.padding(horizontal = Gutter).padding(top = 14.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                slides.indices.forEach { i ->
+                TITLES.indices.forEach { i ->
+                    val on = i == pager.currentPage
+                    val w by animateDpAsState(if (on) 22.dp else 8.dp, label = "dot")
                     Box(
-                        modifier = Modifier
-                            .size(8.dp)
-                            .clip(CircleShape)
-                            .background(Color.White.copy(alpha = if (i == page) 1f else 0.35f)),
+                        Modifier.size(width = w, height = 8.dp)
+                            .background(if (on) Rf.colors.red else Rf.colors.rule, RoundedCornerShape(50)),
                     )
                 }
             }
-
-            Button(
-                onClick = { if (page < slides.lastIndex) page++ else onDone() },
+            PrimaryButton(
+                text = if (last) "Get started" else "Next",
                 modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(bottom = Spacing.xl),
-                shape = RoundedCornerShape(Radius.md),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = Color.White.copy(alpha = 0.2f),
-                    contentColor = Color.White,
-                ),
+                    .padding(horizontal = Gutter)
+                    .padding(top = if (compact) 22.dp else 34.dp, bottom = if (compact) 16.dp else 28.dp),
             ) {
-                Text(
-                    if (page < slides.lastIndex) "Next" else "Get started",
-                    fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier.padding(vertical = Spacing.sm),
-                )
+                if (last) onDone() else scope.launch { pager.animateScrollToPage(pager.currentPage + 1) }
             }
         }
     }
 }
 
+/** 激活页：字标、悬空的红点、"Invite code."、输入框、Activate（同 iOS InviteActivationView）。 */
 @Composable
 fun ActivationScreen(
     activating: Boolean,
@@ -172,132 +121,122 @@ fun ActivationScreen(
     /** 设备被 owner 登出后的一句话提示（平静的提示，不是错误）。 */
     notice: String? = null,
 ) {
-    var code by remember { mutableStateOf("") }
-
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(BrandGradient),
-    ) {
+    var code by rememberSaveable { mutableStateOf("") }
+    var focused by remember { mutableStateOf(false) }
+    val uri = LocalUriHandler.current
+    val view = LocalView.current
+    val scroll = rememberScrollState()
+    // 输入时跟着键盘把输入框、错误和 Activate 一起推到键盘上方：小屏键盘弹着也看得到按钮和结果
+    LaunchedEffect(focused) {
+        if (focused) snapshotFlow { scroll.maxValue }.collect { scroll.scrollTo(it) }
+    }
+    BoxWithConstraints(Modifier.fillMaxSize().background(Rf.colors.paper)) {
+        val compact = maxHeight < 700.dp
         Column(
-            modifier = Modifier
+            Modifier
                 .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = Spacing.lg),
-            horizontalAlignment = Alignment.CenterHorizontally,
+                .safeDrawingPadding()
+                .clipToBounds()
+                .verticalScroll(scroll)
+                .padding(bottom = 20.dp),
         ) {
-            Spacer(Modifier.height(Spacing.xxl))
-
-            // RF 标志：96dp 圆角方块
-            Box(
-                modifier = Modifier
-                    .size(96.dp)
-                    .clip(RoundedCornerShape(Radius.lg))
-                    .background(Color.White.copy(alpha = 0.18f)),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text("RF", fontSize = 38.sp, fontWeight = FontWeight.Bold, color = Color.White)
-            }
-
-            Spacer(Modifier.height(Spacing.lg))
-            Text("RedFluent VPN", fontSize = 36.sp, fontWeight = FontWeight.Bold, color = Color.White)
-            Spacer(Modifier.height(Spacing.sm))
-            Text(
-                "Private secure tunnel for trusted devices",
-                fontSize = 17.sp,
-                color = Color.White.copy(alpha = 0.85f),
-                textAlign = TextAlign.Center,
+            Box(Modifier.padding(horizontal = Gutter).height(50.dp), contentAlignment = Alignment.CenterStart) { Wordmark() }
+            LandingArt(
+                landed = false,
+                height = if (compact) 150f else 200f,
+                showsPower = false,
+                modifier = Modifier.padding(top = if (compact) 0.dp else 12.dp),
             )
-
-            Spacer(Modifier.height(Spacing.xl))
-
-            // 激活卡片
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(Radius.md))
-                    .background(MaterialTheme.colorScheme.surface)
-                    .padding(Spacing.md),
-            ) {
+            Column(Modifier.padding(horizontal = Gutter)) {
+                DotTitle(
+                    "Invite code",
+                    size = if (compact) 44f else 50f,
+                    modifier = Modifier.padding(top = if (compact) 10.dp else 20.dp),
+                )
                 if (notice != null) {
-                    Text(
-                        notice,
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.Medium,
-                        color = MaterialTheme.colorScheme.onSurface,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(Radius.sm))
-                            .background(Brand.Primary.copy(alpha = 0.10f))
-                            .padding(Spacing.sm),
-                    )
-                    Spacer(Modifier.height(Spacing.md))
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 12.dp)) {
+                        Icon(
+                            Icons.AutoMirrored.Filled.Logout,
+                            contentDescription = null,
+                            tint = Rf.colors.red,
+                            modifier = Modifier.size(16.dp),
+                        )
+                        Spacer(Modifier.width(7.dp))
+                        Text(notice, style = RfType.text(14f, FontWeight.SemiBold), color = Rf.colors.red)
+                    }
                 }
-                Text(
-                    "Enter your invite code",
-                    fontSize = 22.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = MaterialTheme.colorScheme.onSurface,
-                )
-                Spacer(Modifier.height(Spacing.sm))
-                Text(
-                    "RedFluent VPN is private invite-only software. " +
-                        "Each device receives its own revocable profile.",
-                    fontSize = 15.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Spacer(Modifier.height(Spacing.md))
-
-                OutlinedTextField(
+                BasicTextField(
                     value = code,
                     onValueChange = { code = it },
-                    placeholder = { Text("Invite code") },
+                    enabled = activating.not(),
                     singleLine = true,
-                    enabled = !activating,
-                    textStyle = MaterialTheme.typography.bodyLarge.copy(fontFamily = FontFamily.Monospace),
+                    textStyle = RfType.mono(20f, medium = true).copy(color = Rf.colors.ink),
+                    cursorBrush = SolidColor(Rf.colors.red),
                     keyboardOptions = KeyboardOptions(
-                        capitalization = KeyboardCapitalization.None,
+                        capitalization = KeyboardCapitalization.Characters,
                         autoCorrectEnabled = false,
                         imeAction = ImeAction.Go,
                     ),
-                    keyboardActions = KeyboardActions(onGo = { onActivate(code) }),
-                    shape = RoundedCornerShape(Radius.sm),
-                    modifier = Modifier.fillMaxWidth(),
+                    keyboardActions = KeyboardActions(onGo = { if (code.isNotBlank()) onActivate(code) }),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = if (compact) 16.dp else 26.dp)
+                        .onFocusChanged { focused = it.isFocused }
+                        .semantics { contentDescription = "Invite code" },
+                    decorationBox = { inner ->
+                        Column {
+                            Box(Modifier.padding(vertical = 14.dp)) {
+                                if (code.isEmpty()) {
+                                    Text("RF-XXXX-XXXX", style = RfType.mono(20f, medium = true), color = Rf.colors.stone)
+                                }
+                                inner()
+                            }
+                            Box(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .height(if (focused) 1.5.dp else 1.dp)
+                                    .background(if (focused) Rf.colors.ink else Rf.colors.rule),
+                            )
+                        }
+                    },
                 )
-
                 if (error != null) {
-                    Spacer(Modifier.height(Spacing.sm))
-                    Text(error, fontSize = 13.sp, color = Brand.Danger)
+                    Text(
+                        error,
+                        style = RfType.text(13f, FontWeight.Medium),
+                        color = Rf.colors.red,
+                        modifier = Modifier.padding(top = 10.dp),
+                    )
                 }
-
-                Spacer(Modifier.height(Spacing.md))
-                Button(
-                    onClick = { onActivate(code) },
-                    enabled = !activating && code.isNotBlank(),
-                    shape = RoundedCornerShape(Radius.md),
-                    colors = ButtonDefaults.buttonColors(containerColor = Brand.Primary),
-                    modifier = Modifier.fillMaxWidth(),
+                // 与 iOS 一样：只在忙的时候禁用；空着点一下只给一个「不行」的触感
+                PrimaryButton(
+                    text = "Activate",
+                    enabled = activating.not(),
+                    busy = activating,
+                    modifier = Modifier.padding(top = 22.dp),
                 ) {
-                    if (activating) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(20.dp),
-                            color = Color.White,
-                            strokeWidth = 2.dp,
-                        )
-                    } else {
-                        Text("Activate", fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(vertical = Spacing.xs))
-                    }
+                    if (code.isBlank()) Haptic.REJECT.perform(view) else onActivate(code)
                 }
+                FooterLinks(onOpen = { runCatching { uri.openUri(it) } }, modifier = Modifier.padding(top = 26.dp))
             }
+        }
+    }
+}
 
-            Spacer(Modifier.height(Spacing.lg))
+/** Privacy · Terms · Support（同 iOS 激活页底部）。 */
+@Composable
+fun FooterLinks(onOpen: (String) -> Unit, modifier: Modifier = Modifier) {
+    Row(modifier, horizontalArrangement = Arrangement.spacedBy(18.dp)) {
+        listOf("Privacy" to PRIVACY_URL, "Terms" to TERMS_URL, "Support" to SUPPORT_URL).forEach { (title, url) ->
             Text(
-                "We do not sell or share your data.",
-                fontSize = 13.sp,
-                color = Color.White.copy(alpha = 0.75f),
-                textAlign = TextAlign.Center,
+                title,
+                style = RfType.text(13f, FontWeight.Medium),
+                color = Rf.colors.stone,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(6.dp))
+                    .clickable(role = Role.Button) { onOpen(url) }
+                    .padding(vertical = 8.dp, horizontal = 2.dp),
             )
-            Spacer(Modifier.height(Spacing.xl))
         }
     }
 }
