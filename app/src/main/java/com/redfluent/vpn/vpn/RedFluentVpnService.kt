@@ -239,6 +239,8 @@ class RedFluentVpnService :
         }
 
         var server: CommandServer? = null
+        // 每次起隧道从空日志开始：引擎以 O_APPEND 打开日志、从不截断（sing-box log/observable.go:64）
+        engineLogFile().delete()
         val configJson = withEngineLog(rawConfig)
         try {
             server = CommandServer(this, this)
@@ -291,26 +293,10 @@ class RedFluentVpnService :
         }
     }
 
-    /**
-     * 把引擎日志落到 app 私有目录，便于排查路由决策。
-     * 引擎默认只写 stdout，在 Android 上等于丢弃。
-     */
-    private fun withEngineLog(raw: String): String = runCatching {
-        val json = kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
-        val obj = json.parseToJsonElement(raw) as kotlinx.serialization.json.JsonObject
-        val logPath = java.io.File(filesDir, "box.log").absolutePath
-        kotlinx.serialization.json.buildJsonObject {
-            obj.forEach { (k, v) -> if (k != "log") put(k, v) }
-            put(
-                "log",
-                kotlinx.serialization.json.buildJsonObject {
-                    put("level", kotlinx.serialization.json.JsonPrimitive("info"))
-                    put("timestamp", kotlinx.serialization.json.JsonPrimitive(true))
-                    put("output", kotlinx.serialization.json.JsonPrimitive(logPath))
-                },
-            )
-        }.toString()
-    }.getOrDefault(raw)
+    private fun engineLogFile() = java.io.File(filesDir, "box.log")
+
+    private fun withEngineLog(raw: String): String =
+        engineLogConfig(raw, engineLogFile().absolutePath, debug = BuildConfig.DEBUG)
 
     /** 主线程：登记「要停」，立刻让界面看到 STOPPING，真正的拆除排在 lifecycle 线程上。 */
     private fun requestStop() {
@@ -694,3 +680,24 @@ class RedFluentVpnService :
         }
     }
 }
+
+/**
+ * 给引擎配置换上我们的日志段，落到 app 私有文件（引擎默认只写 stdout，在 Android 上等于丢弃）。
+ * debug 包用 info，便于排查路由决策；release 包用 warn —— info 级会把每条连接、每次 DNS 的域名写进文件，
+ * 而 release 里没有任何地方读它，留着只会是一份不断变大的访问记录。
+ */
+internal fun engineLogConfig(raw: String, logPath: String, debug: Boolean): String = runCatching {
+    val json = kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
+    val obj = json.parseToJsonElement(raw) as kotlinx.serialization.json.JsonObject
+    kotlinx.serialization.json.buildJsonObject {
+        obj.forEach { (k, v) -> if (k != "log") put(k, v) }
+        put(
+            "log",
+            kotlinx.serialization.json.buildJsonObject {
+                put("level", kotlinx.serialization.json.JsonPrimitive(if (debug) "info" else "warn"))
+                put("timestamp", kotlinx.serialization.json.JsonPrimitive(true))
+                put("output", kotlinx.serialization.json.JsonPrimitive(logPath))
+            },
+        )
+    }.toString()
+}.getOrDefault(raw)
