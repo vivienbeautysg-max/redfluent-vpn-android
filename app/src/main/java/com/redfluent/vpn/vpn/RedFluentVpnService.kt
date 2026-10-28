@@ -28,7 +28,9 @@ import com.redfluent.vpn.data.StopKind
 import com.redfluent.vpn.data.StopReason
 import com.redfluent.vpn.data.TunnelState
 import com.redfluent.vpn.data.configChanged
+import com.redfluent.vpn.data.configReloadDue
 import com.redfluent.vpn.data.decideFollow
+import com.redfluent.vpn.data.isRejected
 import com.redfluent.vpn.data.runtimeRegionParam
 import com.redfluent.vpn.debug.DebugHooks
 import io.nekohasekai.libbox.CommandServer
@@ -167,9 +169,16 @@ class RedFluentVpnService :
     @Volatile
     private var lastGoodConfig: String? = null
 
-    /** 重载失败（已退回 lastGoodConfig）的那份配置：服务器还给同一份时不再每 5 分钟重试。 */
+    /** 重载失败（已退回 lastGoodConfig）的那份配置和失败时刻：见 Follow.kt 的 isRejected。 */
     @Volatile
     private var rejectedConfig: String? = null
+
+    @Volatile
+    private var rejectedAtMs: Long? = null
+
+    /** 连接期间上一次重载成功的时刻（elapsedRealtime），用来拉开「只因配置变了」的重载。 */
+    @Volatile
+    private var lastReloadAtMs: Long? = null
 
     override fun protectSocket(fd: Int): Boolean = protect(fd)
 
@@ -324,6 +333,8 @@ class RedFluentVpnService :
             commandServer = null
             lastGoodConfig = null
             rejectedConfig = null
+            rejectedAtMs = null
+            lastReloadAtMs = null
             closeTun()
         } finally {
             tearingDown = false
@@ -443,10 +454,11 @@ class RedFluentVpnService :
             val r = ApiClient.fetchRuntimeConfig(profile.token, param)
             runtime = r
             val fetched = withEngineLog(r.configJson)
+            val now = SystemClock.elapsedRealtime()
             FollowOutcome.Fetched(
                 r.regionId,
-                configChanged = configChanged(fetched, lastGoodConfig),
-                rejected = fetched == rejectedConfig,
+                configChanged = configChanged(fetched, lastGoodConfig) && configReloadDue(lastReloadAtMs, now),
+                rejected = isRejected(fetched, rejectedConfig, rejectedAtMs, now),
             )
         } catch (e: CancellationException) {
             throw e
@@ -477,7 +489,8 @@ class RedFluentVpnService :
     }
 
     private fun describe(outcome: FollowOutcome): String = when (outcome) {
-        is FollowOutcome.Fetched -> "fetched region=${outcome.regionId?.takeIf { it.isNotBlank() } ?: "-"}"
+        is FollowOutcome.Fetched -> "fetched region=${outcome.regionId?.takeIf { it.isNotBlank() } ?: "-"}" +
+            " changed=${outcome.configChanged} rejected=${outcome.rejected}"
         is FollowOutcome.Failed -> if (outcome.code < 0) "network error" else "http ${outcome.code} ${outcome.reason}"
     }
 
@@ -501,13 +514,15 @@ class RedFluentVpnService :
             if (generation != gen || phase != Phase.RUNNING) return
             server = commandServer ?: return
         }
-        Log.i(TAG, "reload: engine -> region=${runtime.regionId.ifEmpty { "-" }}")
         val config = withEngineLog(runtime.configJson)
+        if (config == lastGoodConfig) return // 两次检查排了同一个重载：前一个已经换好了
+        Log.i(TAG, "reload: engine -> region=${runtime.regionId.ifEmpty { "-" }}")
         try {
             server.startOrReloadService(config, OverrideOptions())
         } catch (e: Exception) {
             Log.w(TAG, "reload failed (${e.javaClass.simpleName}); restoring the previous configuration")
             rejectedConfig = config
+            rejectedAtMs = SystemClock.elapsedRealtime()
             val previous = lastGoodConfig
             val restored = previous != null && try {
                 server.startOrReloadService(previous, OverrideOptions())
@@ -540,6 +555,8 @@ class RedFluentVpnService :
             if (generation != gen) return // 重载期间收到了 STOP：排在后面的 teardown 会清理
             lastGoodConfig = config
             rejectedConfig = null
+            rejectedAtMs = null
+            lastReloadAtMs = SystemClock.elapsedRealtime()
             _activeRegionId.value = runtime.regionId.takeIf { it.isNotBlank() }
             _activeRegion.value = runtime.regionName.takeIf { it.isNotBlank() }
         }

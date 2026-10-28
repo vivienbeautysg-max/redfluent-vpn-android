@@ -52,6 +52,21 @@ private val REGION_ERRORS = setOf("region not allowed", "region unavailable", "u
 fun configChanged(fetched: String?, running: String?): Boolean =
     fetched != null && running != null && fetched != running
 
+/** 只因配置变了（同区域）的重载最多 30 分钟一次：万一服务器回的配置不是逐字节稳定的，也不会每 5 分钟断一次连接。换区域不受限。 */
+const val CONFIG_RELOAD_GAP_MS = 30 * 60 * 1000L
+
+/** 加载失败的配置这么久内不再试（一时的失败过后还能再试一次）。 */
+const val REJECTED_FOR_MS = 60 * 60 * 1000L
+
+/** 时间都用 SystemClock.elapsedRealtime()（单调时钟）。 */
+fun configReloadDue(lastReloadAtMs: Long?, nowMs: Long): Boolean =
+    lastReloadAtMs == null || nowMs - lastReloadAtMs >= CONFIG_RELOAD_GAP_MS
+
+/** 取到的正是加载失败的那份配置，且失败还不到 [REJECTED_FOR_MS]。 */
+fun isRejected(fetched: String?, rejected: String?, rejectedAtMs: Long?, nowMs: Long): Boolean =
+    fetched != null && rejected != null && rejectedAtMs != null && fetched == rejected &&
+        nowMs - rejectedAtMs < REJECTED_FOR_MS
+
 /**
  * 跟随决策（纯函数）：
  *  - 取到配置：区域和正在用的不同 → 重载；区域相同（或比较不了）但配置变了 → 也重载

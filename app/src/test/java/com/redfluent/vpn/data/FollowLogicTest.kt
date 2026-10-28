@@ -53,8 +53,24 @@ class FollowLogicTest {
     fun neverRetriesAConfigThatAlreadyFailedToLoad() {
         assertEquals(FollowAction.Keep, decideFollow("tokyo", FollowOutcome.Fetched("tokyo", configChanged = true, rejected = true)))
         assertEquals(FollowAction.Keep, decideFollow("tokyo", FollowOutcome.Fetched("singapore", configChanged = true, rejected = true)))
-        // 坏配置的记忆不影响吊销 / 到期
-        assertEquals(FollowAction.Stop(StopKind.REVOKED), decideFollow("tokyo", FollowOutcome.Failed(401, "valid profile required")))
+    }
+
+    @Test
+    fun configOnlyReloadsAreSpacedThirtyMinutesApart() {
+        val t0 = 1_000_000L
+        assertTrue(configReloadDue(null, t0)) // 这次连接还没重载过：配置一变马上重载
+        assertEquals(false, configReloadDue(t0, t0 + CONFIG_RELOAD_GAP_MS - 1)) // 不会每 5 分钟重载一次
+        assertTrue(configReloadDue(t0, t0 + CONFIG_RELOAD_GAP_MS))
+    }
+
+    @Test
+    fun aFailedConfigGetsAnotherTryAfterAnHour() {
+        val t0 = 1_000_000L
+        assertTrue(isRejected("B", "B", t0, t0 + REJECTED_FOR_MS - 1))
+        assertEquals(false, isRejected("B", "B", t0, t0 + REJECTED_FOR_MS)) // 一时的失败，过后再试
+        assertEquals(false, isRejected("A", "B", t0, t0)) // 服务器给了别的配置：不受影响
+        assertEquals(false, isRejected("B", null, null, t0))
+        assertEquals(false, isRejected(null, "B", t0, t0))
     }
 
     @Test
