@@ -19,8 +19,16 @@ fun runtimeRegionParam(isOwner: Boolean, selected: String?, regions: List<Region
 
 /** 一次跟随检查的结果（只保留决策需要的信息）。 */
 sealed interface FollowOutcome {
-    /** 取到了配置；regionId 是服务器回显的区域（旧后端不回显则为空）。 */
-    data class Fetched(val regionId: String?) : FollowOutcome
+    /**
+     * 取到了配置；regionId 是服务器回显的区域（旧后端不回显则为空）。
+     * configChanged：取到的配置和引擎正在跑的不同（见 [configChanged]）；
+     * rejected：取到的正是上次重载失败、已退回旧配置的那一份。
+     */
+    data class Fetched(
+        val regionId: String?,
+        val configChanged: Boolean = false,
+        val rejected: Boolean = false,
+    ) : FollowOutcome
 
     /** 请求失败。code < 0 表示没连上服务器（网络错误）。 */
     data class Failed(val code: Int, val reason: String, val expiresAt: String? = null) : FollowOutcome
@@ -31,7 +39,7 @@ sealed interface FollowAction {
     /** 什么也不做（区域没变 / 暂时取不到，下个周期再试）。 */
     data object Keep : FollowAction
 
-    /** 服务器给的区域和正在用的不同：用刚取到的配置热重载引擎。 */
+    /** 服务器给的区域和正在用的不同，或同区域但配置变了：用刚取到的配置热重载引擎。 */
     data object Reload : FollowAction
 
     /** 账号到期 / 被吊销：停掉隧道并告诉界面。 */
@@ -40,9 +48,15 @@ sealed interface FollowAction {
 
 private val REGION_ERRORS = setOf("region not allowed", "region unavailable", "unknown region")
 
+/** 取到的配置和引擎正在跑的不同。任一边未知都算没变：绝不凭猜测重载。两边都是同一套 withEngineLog 加工后的字符串。 */
+fun configChanged(fetched: String?, running: String?): Boolean =
+    fetched != null && running != null && fetched != running
+
 /**
  * 跟随决策（纯函数）：
- *  - 取到配置：区域和正在用的不同 → 重载；相同、或比较不了（旧后端不回显区域）→ 保持；
+ *  - 取到配置：区域和正在用的不同 → 重载；区域相同（或比较不了）但配置变了 → 也重载
+ *    （2026-10-28：东京换服务器，此前已连着的隧道只认区域，一直连着已停的旧机，直到用户自己重连）；
+ *    正是上次重载失败的那份配置 → 保持，不每 5 分钟重试；其余 → 保持；
  *  - 403 "invite expired" → 到期，停；
  *  - 401，或其它 403（设备 / 邀请码被停用）→ 吊销，停；
  *  - 区域类的 403 / 5xx / 网络错误 / 其它 → 保持运行，下个周期再试（绝不因为暂时的故障断开用户）。
@@ -51,7 +65,12 @@ fun decideFollow(activeRegionId: String?, outcome: FollowOutcome): FollowAction 
     is FollowOutcome.Fetched -> {
         val returned = normalizeRegionId(outcome.regionId)
         val active = normalizeRegionId(activeRegionId)
-        if (returned.isNotEmpty() && active.isNotEmpty() && returned != active) FollowAction.Reload else FollowAction.Keep
+        when {
+            outcome.rejected -> FollowAction.Keep
+            returned.isNotEmpty() && active.isNotEmpty() && returned != active -> FollowAction.Reload
+            outcome.configChanged -> FollowAction.Reload
+            else -> FollowAction.Keep
+        }
     }
 
     is FollowOutcome.Failed -> {

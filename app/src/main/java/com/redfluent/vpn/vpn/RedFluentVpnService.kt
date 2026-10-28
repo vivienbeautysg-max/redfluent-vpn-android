@@ -27,6 +27,7 @@ import com.redfluent.vpn.data.REGION_TOKYO
 import com.redfluent.vpn.data.StopKind
 import com.redfluent.vpn.data.StopReason
 import com.redfluent.vpn.data.TunnelState
+import com.redfluent.vpn.data.configChanged
 import com.redfluent.vpn.data.decideFollow
 import com.redfluent.vpn.data.runtimeRegionParam
 import com.redfluent.vpn.debug.DebugHooks
@@ -165,6 +166,10 @@ class RedFluentVpnService :
     /** 引擎正在跑的那份配置（已加好日志设置）；重载失败时用它恢复。 */
     @Volatile
     private var lastGoodConfig: String? = null
+
+    /** 重载失败（已退回 lastGoodConfig）的那份配置：服务器还给同一份时不再每 5 分钟重试。 */
+    @Volatile
+    private var rejectedConfig: String? = null
 
     override fun protectSocket(fd: Int): Boolean = protect(fd)
 
@@ -318,6 +323,7 @@ class RedFluentVpnService :
             closeQuietly(commandServer)
             commandServer = null
             lastGoodConfig = null
+            rejectedConfig = null
             closeTun()
         } finally {
             tearingDown = false
@@ -436,7 +442,12 @@ class RedFluentVpnService :
         val outcome: FollowOutcome = try {
             val r = ApiClient.fetchRuntimeConfig(profile.token, param)
             runtime = r
-            FollowOutcome.Fetched(r.regionId)
+            val fetched = withEngineLog(r.configJson)
+            FollowOutcome.Fetched(
+                r.regionId,
+                configChanged = configChanged(fetched, lastGoodConfig),
+                rejected = fetched == rejectedConfig,
+            )
         } catch (e: CancellationException) {
             throw e
         } catch (e: ApiException) {
@@ -496,6 +507,7 @@ class RedFluentVpnService :
             server.startOrReloadService(config, OverrideOptions())
         } catch (e: Exception) {
             Log.w(TAG, "reload failed (${e.javaClass.simpleName}); restoring the previous configuration")
+            rejectedConfig = config
             val previous = lastGoodConfig
             val restored = previous != null && try {
                 server.startOrReloadService(previous, OverrideOptions())
@@ -527,6 +539,7 @@ class RedFluentVpnService :
         synchronized(lock) {
             if (generation != gen) return // 重载期间收到了 STOP：排在后面的 teardown 会清理
             lastGoodConfig = config
+            rejectedConfig = null
             _activeRegionId.value = runtime.regionId.takeIf { it.isNotBlank() }
             _activeRegion.value = runtime.regionName.takeIf { it.isNotBlank() }
         }

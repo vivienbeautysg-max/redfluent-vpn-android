@@ -37,6 +37,34 @@ class FollowLogicTest {
         assertEquals(FollowAction.Keep, decideFollow("", FollowOutcome.Fetched("singapore")))
     }
 
+    // ---- 同区域、配置变了：也重载（2026-10-28 东京换服务器，已连着的隧道一直连旧机） ----------------
+
+    @Test
+    fun reloadsWhenTheSameRegionComesBackWithAnotherConfig() {
+        assertEquals(FollowAction.Reload, decideFollow("tokyo", FollowOutcome.Fetched("tokyo", configChanged = true)))
+        assertEquals(FollowAction.Reload, decideFollow("Tokyo", FollowOutcome.Fetched(" tokyo ", configChanged = true)))
+        // 比不了区域，但配置确实变了（configChanged 只在两边都已知时为真）
+        assertEquals(FollowAction.Reload, decideFollow("tokyo", FollowOutcome.Fetched(null, configChanged = true)))
+        assertEquals(FollowAction.Reload, decideFollow(null, FollowOutcome.Fetched("tokyo", configChanged = true)))
+        assertEquals(FollowAction.Reload, decideFollow("tokyo", FollowOutcome.Fetched("singapore", configChanged = true)))
+    }
+
+    @Test
+    fun neverRetriesAConfigThatAlreadyFailedToLoad() {
+        assertEquals(FollowAction.Keep, decideFollow("tokyo", FollowOutcome.Fetched("tokyo", configChanged = true, rejected = true)))
+        assertEquals(FollowAction.Keep, decideFollow("tokyo", FollowOutcome.Fetched("singapore", configChanged = true, rejected = true)))
+        // 坏配置的记忆不影响吊销 / 到期
+        assertEquals(FollowAction.Stop(StopKind.REVOKED), decideFollow("tokyo", FollowOutcome.Failed(401, "valid profile required")))
+    }
+
+    @Test
+    fun configChangedOnlyWhenBothSidesAreKnownAndDiffer() {
+        assertTrue(configChanged("{\"a\":2}", "{\"a\":1}"))
+        assertEquals(false, configChanged("{\"a\":1}", "{\"a\":1}"))
+        assertEquals(false, configChanged(null, "{\"a\":1}"))
+        assertEquals(false, configChanged("{\"a\":1}", null))
+    }
+
     // ---- 失败：到期 / 吊销才停，其余一律保持运行 ------------------------------------------------
 
     @Test
