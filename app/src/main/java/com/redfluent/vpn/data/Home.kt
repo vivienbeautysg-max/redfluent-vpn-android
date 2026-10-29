@@ -115,11 +115,15 @@ object HomeFormat {
         return String.format(Locale.US, "%02d:%02d:%02d", s / 3600, (s % 3600) / 60, s % 60)
     }
 
-    /** 已用 GB："12.4"（一位小数；1000 起不带小数）；不知道 / 不是数 → "—"。 */
+    /** 已用 GB："12.4"（一位小数；1000 起不带小数）；不足 1 GB 两位小数（"0.03" —— 一位小数把 27 MB 显示成 "0.0"，
+     *  MAX 2026-10-29），比 0 多一点点 → "<0.01"；不知道 / 不是数 → "—"。 */
     fun gigabytes(value: Double?): String {
         if (value == null || !value.isFinite()) return NONE
         val v = value.coerceAtLeast(0.0)
-        return if (v < 1000) String.format(Locale.US, "%.1f", v) else String.format(Locale.US, "%.0f", v)
+        if (v == 0.0) return "0.0"
+        if (v < 0.005) return "<0.01"
+        if (v < 0.995) return String.format(Locale.US, "%.2f", v)
+        return if (v < 999.5) String.format(Locale.US, "%.1f", v) else String.format(Locale.US, "%.0f", v)
     }
 
     /** 配额："100"，不是整数时 "12.5"。 */
